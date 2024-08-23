@@ -2,7 +2,7 @@
 Streamline - SL
 =======================
 
-Version 2.1.0
+Version 2.4.11
 =======
 
 1 SETTING UP
@@ -133,7 +133,7 @@ Here is the typical lifecycle for SL features:
 * After device creation, any calls to SL will succeed only if the feature is FULLY functional on that device
   * This means that the set of features that return true from `slIsFeatureSupported` AFTER device creation can be smaller (but not larger) than the set that returned true from `slIsFeatureSupported` after slInit, but before device creation
   * And thus, at this point, any SL method can be used safely since all required and supported features are initialized
-  * In addition, at this point it is possible to [explicitly allocate/free resources used by feature(s)](#2224-resource-allocation-and-de-allocation)
+  * In addition, at this point it is possible to [explicitly allocate/free resources used by feature(s)](#27-explicit-resource-allocation-and-de-allocation)
 
 > **IMPORTANT:**
 > `slInit` must NOT be called within DLLMain entry point in your application because that can cause a deadlock.
@@ -397,7 +397,7 @@ SL_API sl::Result slInit(const sl::Preferences &pref, uint64_t sdkVersion = sl::
 All SL functions return `sl::Result` which is defined in `sl_result.h`. However, since SL can be used as an interposer **it is not always possible to immediately report all errors or warnings after a specific SL API is invoked**. This is because some functionality can be triggered with some delay or asynchronously when DXGI/D3D/Vulkan APIs are called by the host application. Therefore, the SL SDK provides `Preferences::logMessagesCallback` so that any **asynchronous errors or warnings** can be tracked by placing breakpoints when `eLogTypeError` and/or `eLogTypeWarn` messages are received. Another useful feature is the debug console window, which should be enabled in development by setting `Preferences::showConsole` to true. In the debug console window, each error will be highlighted in red while warnings are highlighted in yellow to make it easier to notice them.
 
 > **NOTE:**
-> See [section 2.4](#24-checking-features-configuration) for more details on how to get detailed information if specific feature is not supported or fails to initialize.
+> See [section 2.4](#24-checking-if-a-feature-is-supported) for more details on how to get detailed information if specific feature is not supported or fails to initialize.
 
 #### 2.2.5 OVER THE AIR (OTA) UPDATES
 
@@ -963,6 +963,60 @@ slSetTag(viewport, &depthTag, 1);
 
 For the complete list of the required buffer tags for a given feature please call `slGetFeatureRequirements`.
 
+### Resource extensions
+Some resource extensions can be supplied to `ResourceTag` to pass extra information. Extensions can be supplied in 2 ways:
+* **Member variable**: Member variable to the `ResourceTag`, with the appropriate struct version number
+* **Chain extension**: As part of the `ResouceTag` chain, in its `next` pointer member variable
+
+>**NOTE:**
+Chain extensions should all come immediately after the tag they belong to.
+
+#### Resource `Extent` (member variable, `kStructVersion1`)
+When a resource is suballocated as part of a bigger resource, please properly populate the `Extent` member variable as part of the `ResourceTag`. The `Extent` should indicate the top-left corner of the subresource relative to the tagged resource, as well as the width and height of the subresource.
+
+```cpp
+
+// Example extent: resource that starts in the middle of the tagged resource, and is at 1/8th of the tagged resource's resolution.
+// Illustration: The xxx represent the subresource that the extents define
+// -----------------
+// -----------------
+// -----------------
+// --------xxxx-----
+// --------xxxx-----
+// -----------------
+// -----------------
+
+Extent depthExtent{};
+depthExtent.top = depthResourceHeight / 2;
+depthExtent.left = depthResourceWidth / 2;
+depthExtent.height = depthResourceHeight / 4;
+depthExtent.width= depthResourceWidth / 4;
+
+ResourceTag depthTag{};
+depthTag.extent = depthExtent;
+```
+#### Resource `PrecisionInfo` (chain extension)
+Some buffers (e.g., `kBufferTypeBidirectionalDistortionField`) can be supplied with a `PrecisionInfo` struct as an extension (`next` ptr) to the `ResourceTag`. This struct allows a plugin to internally convert the low-precision buffer data to a higher-precision format, for better image quality purposes.
+
+Populating the `PrecisionInfo` accurately requires knowing the bounds the high-precision data, so that good `scale` and `bias` values are supplied.
+
+```cpp
+// These max and min values should be computed as part of a reduction phase, and should be used to convert
+// the high-precision data to a low-precision format
+// The conversion, using a linear transform, could look like the following:
+//     lowPrecisionData = (hiPrecisionData - bufferMinVal) / (bufferMaxVal - bufferMinVal)
+float bufferMaxVal; // max value in the high-precision format
+float bufferMinVal; // min value in the high-precision format
+
+PrecisionInfo bufferPrecisionInfo{};
+bufferPrecisionInfo.conversionFormula = PrecisionFormula::eLinearTransform;
+bufferPrecisionInfo.bias = bufferMinVal;
+bufferPrecisionInfo.scale = bufferMaxVal - bufferMinVal;
+
+ResourceTag tag{};
+tag.next = &bufferPrecisionInfo;
+```
+
 ### 2.9 FRAME TRACKING
 
 SL requires correct frame tracking since host application could be working on multiple frames at the same time and various SL inputs must be matched with the frame that is actually being presented. When the simulation phase for the new frame is starting in the host application the frame tracking handle for that specific frame should be obtained from the SL (this would be the exact same place where normally the `sl::ReflexMarker::eSimulationStart` would be placed, see [Reflex guide](./ProgrammingGuideReflex.md) for more details)).
@@ -1191,7 +1245,7 @@ By design, SL SDK enables `host assisted replacement or injection of specific re
 SL_API sl::Result slEvaluateFeature(sl::Feature feature, const sl::FrameToken& frame, const sl::BaseStructure** inputs, uint32_t numInputs, sl::CommandBuffer* cmdBuffer);
 ```
 
-Plase note that **host is responsible for restoring the command buffer(list) state** after calling `slEvaluate`. For more details on which states are affected please see [restore pipeline section](./ProgrammingGuideManualHooking.md#80-restoring-command-listbuffer-state)
+Plase note that **host is responsible for restoring the command buffer(list) state** after calling `slEvaluate`. For more details on which states are affected please see [restore pipeline section](./ProgrammingGuideManualHooking.md#70-restoring-command-listbuffer-state)
 
 > **NOTE:**
 > DLSS-G is a unique case since it already has the marker provided by the existing API (SwapChain::Present) hence there is no need to call `slEvaluateFeature` to enable DLSS-G
@@ -1292,6 +1346,14 @@ SL_API sl::Result slShutdown();
 > If shutdown is called too early, any SL features which are enabled and running will stop functioning and the host application will fallback to the
 default implementation. For example, if DLSS is enabled and running and shutdown is called, the `sl.dlss` plugin will be unloaded, hence any `evaluate` or `slIsFeatureSupported` calls will return an error and the host application should fallback to the default implementation (for example TAAU)
 
+### 2.15 MULTIPLE SWAP CHAINS
+
+The current tagging API in Streamline is designed with a single swap chain in mind.  When a resource is tagged with a life-cycle of `eValidUntilPresent` there is no way to specify on which swap chain the Present() is.
+
+So, if Streamline sees multiple swap chains- it will hook the first one, and it will log a warning for all other swap chains.
+
+If an application needs to create multiple swap chains, it can use [manual hooking](ProgrammingGuideManualHooking.md)- and use `slUpgradeInterface()` to inform Streamline which swap chain it needs to attach to.  That way the warning about multiple swap chains may be avoided.
+
 3 VALIDATING SL INTEGRATION WHEN REPLACING PLATFORM LIBRARIES
 -----------------------------
 
@@ -1324,7 +1386,7 @@ The remaining modules are optional depending on which features are enabled in yo
 
 * If Steam overlay is not showing up please ensure that SteamAPI_Init() is called **before** any D3D or DXGI calls (device create, factory create etc.)
 * If D3D debug layer is complaining about incorrect resource states please provide correct state when tagging SL resources (see sl::Resource structure)
-* If you get a crash in Swapchain::Present or some similar unexpected behavior please double check that you are NOT linking dxgi.lib/d3d12.lib together with the sl.interposer.dll. See [section 3](#3-validating-sl-integration) in this guide.
+* If you get a crash in Swapchain::Present or some similar unexpected behavior please double check that you are NOT linking dxgi.lib/d3d12.lib together with the sl.interposer.dll. See [section 3](#3-validating-sl-integration-when-replacing-platform-libraries) in this guide.
 * If SL does not work correctly make sure that some other library which includes `dxgi` or `d3d11/12` is not linked in your application (like for example `WindowsApp.lib`)
 * Third party overlays can disable SL interposer, always make sure to call `slSetD3DDevice` or `slSetVulkanInfo`
 * Make sure that all matrices are multiplied in the correct order and provided in row-major order **without any jitter**
@@ -1400,6 +1462,24 @@ else
 > NOTE
 > Third party libraries SHOULD NOT use SL proxies to avoid app instability.
 
+### 5.4 CMAKE SUPPORT
+
+A `CMakeLists.txt` file is included for integrations using [CMake](https://cmake.org).  Uncompress the Streamline package (e.g. to `streamline`) and in one of your `CMakeLists.txt` add:
+```
+add_directory(streamline)
+```
+
+It contains the following CMake Options:
+| Option Name | Description | Default |
+|--|--|--|
+| STREAMLINE_FEATURE_DLSS_SR | Include DLSS-SR dll | OFF
+| STREAMLINE_FEATURE_NRD | Include NRD dll | OFF
+| STREAMLINE_FEATURE_IMGUI | Include Imgui dll | OFF
+| STREAMLINE_FEATURE_REFLEX | Include Reflex dll | OFF
+| STREAMLINE_FEATURE_NIS | Include NIS dll | OFF
+| STREAMLINE_FEATURE_DLSS_FG | Include DLSS-FG dll | OFF
+| STREAMLINE_IMPORT_AS_INTERFACE | Import Streamline as an Interface without lib | OFF
+
 6 EXCEPTION HANDLING
 ------------------------------------------------
 
@@ -1409,3 +1489,4 @@ If an exception is thrown while executing SL code mini-dump will be writted in `
 ------------------------------------------------
 
 For any SL related questions, please email StreamlineSupport@nvidia.com.
+

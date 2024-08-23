@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -28,7 +28,7 @@
 namespace sl
 {
 
-#define SL_VK_FEATURE(n) if(strcmp(featureNames[i], #n) == 0) features.##n = VK_TRUE;
+#define SL_VK_FEATURE(n) if(strcmp(featureNames[i], #n) == 0) features.n = VK_TRUE;
 
 inline VkPhysicalDeviceVulkan12Features getVkPhysicalDeviceVulkan12Features(uint32_t featureCount, const char** featureNames)
 {
@@ -115,7 +115,7 @@ inline VkPhysicalDeviceVulkan13Features getVkPhysicalDeviceVulkan13Features(uint
 //! leveraging vkCreateDevice and vkCreateInstance proxies provided by SL.
 //!
 //! {0EED6FD5-82CD-43A9-BDB5-47A5BA2F45D6}
-SL_STRUCT(VulkanInfo, StructType({ 0xeed6fd5, 0x82cd, 0x43a9, { 0xbd, 0xb5, 0x47, 0xa5, 0xba, 0x2f, 0x45, 0xd6 } }), kStructVersion2)
+SL_STRUCT(VulkanInfo, StructType({ 0xeed6fd5, 0x82cd, 0x43a9, { 0xbd, 0xb5, 0x47, 0xa5, 0xba, 0x2f, 0x45, 0xd6 } }), kStructVersion3)
 VkDevice device {};
 VkInstance instance{};
 VkPhysicalDevice physicalDevice{};
@@ -131,6 +131,9 @@ uint32_t graphicsQueueFamily{};
 uint32_t opticalFlowQueueIndex{};
 uint32_t opticalFlowQueueFamily{};
 bool useNativeOpticalFlowMode = false;
+uint32_t computeQueueCreateFlags{};
+uint32_t graphicsQueueCreateFlags{};
+uint32_t opticalFlowQueueCreateFlags{};
 };
 
 }

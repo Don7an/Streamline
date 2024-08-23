@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -68,7 +68,7 @@ struct CommonInterfaceContext
 #ifdef SL_CAPTURE
     sl::chi::ICapture* capture{};
 #endif
-    uint32_t currentFrame{};
+    uint64_t currentFrame{};
 
     IDXGIAdapter3* adapter{};
 
@@ -113,10 +113,17 @@ struct CommonInterfaceContext
         }
         return threadsVulkan->getContext();
     }
+
+    UINT64 m_maxMemoryUsage = 0;
 };
 
 //! Our secondary context
 CommonInterfaceContext ctx;
+
+uint64_t getCurrentFrame()
+{
+    return ctx.currentFrame;
+}
 
 //! Get GPU information and share with other plugins
 //! 
@@ -135,6 +142,7 @@ bool getSystemCaps(common::SystemCaps*& info)
 
     PFND3DKMT_ENUMADAPTERS2 pfnEnumAdapters2{};
     PFND3DKMT_QUERYADAPTERINFO pfnQueryAdapterInfo{};
+    PFND3DKMT_CLOSEADAPTER pfnCloseAdapter{};
 
     // We support up to kMaxNumSupportedGPUs adapters (currently 8)
     SL_LOG_INFO("Enumerating up to %u adapters but only one of them can be used to create a device - no mGPU support in this SDK", kMaxNumSupportedGPUs);
@@ -147,6 +155,7 @@ bool getSystemCaps(common::SystemCaps*& info)
     {
         pfnEnumAdapters2 = (PFND3DKMT_ENUMADAPTERS2)GetProcAddress(modGDI32, "D3DKMTEnumAdapters2");
         pfnQueryAdapterInfo = (PFND3DKMT_QUERYADAPTERINFO)GetProcAddress(modGDI32, "D3DKMTQueryAdapterInfo");
+        pfnCloseAdapter = (PFND3DKMT_CLOSEADAPTER)GetProcAddress(modGDI32, "D3DKMTCloseAdapter");
 
         // Request adapter info from KMT
         if (pfnEnumAdapters2)
@@ -295,6 +304,20 @@ bool getSystemCaps(common::SystemCaps*& info)
         {
             SL_LOG_WARN("NVAPI failed to initialize, please update your driver if running on NVIDIA hardware");
         }
+    }
+
+    if (pfnCloseAdapter)
+    {
+        for (uint32_t k = 0; k < enumAdapters2.NumAdapters; k++)
+        {
+            const D3DKMT_CLOSEADAPTER adapter { adapterInfo[k].hAdapter };
+            auto res = pfnCloseAdapter(&adapter);
+            if (!NT_SUCCESS(res))
+            {
+                SL_LOG_WARN("Failed to close adapter 0x%x: %u", adapter.hAdapter, res);
+            }
+        }
+        enumAdapters2 = {};
     }
 
     if (modGDI32)
@@ -552,6 +575,11 @@ void presentCommon(UINT Flags)
                 DXGI_QUERY_VIDEO_MEMORY_INFO videoMemoryInfo{};
                 ctx.adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &videoMemoryInfo);
                 ctx.compute->setVRAMBudget(videoMemoryInfo.CurrentUsage, videoMemoryInfo.Budget);
+                if (videoMemoryInfo.CurrentUsage > ctx.m_maxMemoryUsage)
+                {
+                    ctx.m_maxMemoryUsage = videoMemoryInfo.CurrentUsage;
+                    SL_LOG_VERBOSE("max recorded mem usage: %.2lf GB", ctx.m_maxMemoryUsage / (double)(1024 * 1024 * 1024));
+                }
             }
         }
         else
@@ -664,9 +692,10 @@ void presentCommon(UINT Flags)
 #endif
         }
 
-        ctx.currentFrame++;
+        ++ctx.currentFrame;
+
         // This will release any resources scheduled to be destroyed few frames behind
-        CHI_VALIDATE(ctx.compute->collectGarbage(ctx.currentFrame));
+        CHI_VALIDATE(ctx.compute->collectGarbage((uint32_t)ctx.currentFrame));
         // This will release unused recycled resources (volatile tag copies)
         ctx.pool->collectGarbage();
     }
@@ -689,6 +718,14 @@ void presentCommon(UINT Flags)
     api::getContext()->parameters->set(sl::param::common::kStats, (void*)s_stats.c_str());*/
 }
 
+void afterPresentCommon(UINT Flags)
+{
+    if ((Flags & DXGI_PRESENT_TEST))
+    {
+        return;
+    }
+}
+
 HRESULT slHookPresent1(IDXGISwapChain* swapChain, UINT SyncInterval, UINT Flags, DXGI_PRESENT_PARAMETERS* params, bool& Skip)
 {
     presentCommon(Flags);
@@ -698,6 +735,12 @@ HRESULT slHookPresent1(IDXGISwapChain* swapChain, UINT SyncInterval, UINT Flags,
 HRESULT slHookPresent(IDXGISwapChain* swapChain, UINT SyncInterval, UINT Flags, bool& Skip)
 {
     presentCommon(Flags);
+    return S_OK;
+}
+
+HRESULT slHookAfterPresent(UINT Flags)
+{
+    afterPresentCommon(Flags);
     return S_OK;
 }
 
@@ -712,6 +755,13 @@ HRESULT slHookResizeSwapChainPre(IDXGISwapChain* swapChain, UINT BufferCount, UI
 VkResult slHookVkPresent(VkQueue Queue, const VkPresentInfoKHR* PresentInfo, bool& Skip)
 {
     presentCommon(0);
+
+    return VK_SUCCESS;
+}
+
+VkResult slHookVkAfterPresent()
+{
+    afterPresentCommon(0);
 
     return VK_SUCCESS;
 }

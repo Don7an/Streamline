@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -23,12 +23,14 @@
 #pragma once
 
 #include <vector>
+#include <list>
 #include <functional>
 #include <mutex>
 #include <atomic>
 #include <map>
 
 #include "source/core/sl.exception/exception.h"
+#include "source/core/sl.log/log.h"
 
 using namespace std::chrono_literals;
 
@@ -56,11 +58,11 @@ struct ThreadContext
     {
         for (auto& t : threads)
         {
-            delete t;
+            t.reset();
         }
         for (auto& t : threadMap)
         {
-            delete t.second;
+            t.second.reset();
         }
         threads.clear();
         threadMap.clear();
@@ -88,13 +90,15 @@ struct ThreadContext
             auto it = threadMap.find(id);
             if (it == threadMap.end())
             {
-                T* context = new T;
-                // If we switched to this later in the game copy our context if any
+                // If we switched to this later in the game, co-own existing context, if any
                 if (threads.size() > (size_t)id && threads[id])
                 {
-                    *context = *threads[id];
+                    threadMap[id] = threads[id];
                 }
-                threadMap[id] = context;
+                else
+                {
+                    threadMap[id] = std::make_shared<T>();
+                }
             }
             return *threadMap[id];
         }
@@ -102,7 +106,7 @@ struct ThreadContext
         // Each thread has different id so no need to sync here
         if (!threads[id])
         {
-            threads[id] = new T();
+            threads[id] = std::make_shared<T>();
             threadCount++;
             SL_LOG_HINT("detected new thread %u - total threads %u", id, threadCount.load());
         }
@@ -113,8 +117,8 @@ protected:
 
     std::atomic<bool> useThreadMap = false;
     std::mutex mutex = {};
-    std::vector<T*> threads = {};
-    std::map<DWORD, T*> threadMap = {};
+    std::vector<std::shared_ptr<T>> threads = {};
+    std::map<DWORD, std::shared_ptr<T>> threadMap = {};
     std::atomic<uint32_t> threadCount = {};
 };
 
@@ -132,7 +136,7 @@ class WorkerThread
 
     size_t m_jobCount = 0;
     std::thread m_thread;
-    std::vector<std::pair<bool, std::function<void(void)>>> m_work{};
+    std::list<std::pair<bool, std::function<void(void)>>> m_work{};
     std::wstring m_name;
 
     void workerFunction()
@@ -238,20 +242,6 @@ public:
 
         return true;
     }
-};
-
-struct scoped_lock
-{
-    scoped_lock(CRITICAL_SECTION& criticalSection)
-    {
-        m_criticalSection = &criticalSection;
-        EnterCriticalSection(m_criticalSection);
-    }
-    ~scoped_lock()
-    {
-        LeaveCriticalSection(m_criticalSection);
-    }
-    CRITICAL_SECTION* m_criticalSection;
 };
 
 struct LockAtomic

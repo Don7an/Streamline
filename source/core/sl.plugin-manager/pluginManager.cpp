@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -124,35 +124,24 @@ public:
 #ifndef SL_PRODUCTION
         auto interposerConfig = sl::interposer::getInterface()->getConfig();
 
-        // Build inclusion list based on preferences
-        std::vector<Feature> features =
-        {
-            kFeatureDLSS,
-            kFeatureNRD,
-            kFeatureNIS,
-            kFeatureReflex,
-            kFeatureDLSS_G,
-            kFeatureImGUI
-        };
+        //! NOTE: There is no need build a list of available plugins, we don't want unnecessary dependencies
+        //!
+        //! Moving forward, plugins will be developed independently and ids will be unknown to the interposer
 
         // Allow override via JSON config file
         if (interposerConfig.loadAllFeatures)
         {
             SL_LOG_HINT("Loading all features");
-            m_featuresToLoad = features;
+            m_loadAllFeatures = true;
         }
         if (!interposerConfig.loadSpecificFeatures.empty() && m_featuresToLoad.empty())
         {
             for (auto& id : interposerConfig.loadSpecificFeatures) try
             {
-                if (std::find(features.begin(), features.end(), id) == features.end())
-                {
-                    SL_LOG_WARN("Feature '%s' in 'loadSpecificFeatures' list is invalid - ignoring", getFeatureAsStr((Feature)id));
-                }
-                else
-                {
-                    m_featuresToLoad.push_back((Feature)id);
-                }
+                //! NOTE: There is no need to validate this list, if feature is invalid it will simply be ignored
+                //!
+                //! Moving forward, plugins will be developed independently and ids will be unknown to the interposer 
+                m_featuresToLoad.push_back((Feature)id);
             }
             catch (std::exception& e)
             {
@@ -178,6 +167,8 @@ public:
 
         // sl.common is always enabled
         m_featuresToLoad.push_back(kFeatureCommon);
+        // PC Latency is always available on all platforms
+        m_featuresToLoad.push_back(kFeaturePCL);
 
         // These are not safe to touch after we exit here
         m_pref.pathsToPlugins = {};
@@ -208,6 +199,17 @@ public:
     virtual bool isInitialized() const  override final { return s_status == PluginManagerStatus::ePluginsInitialized; }
     virtual bool arePluginsLoaded() const  override final { return s_status == PluginManagerStatus::ePluginsInitialized || s_status == PluginManagerStatus::ePluginsLoaded; }
 
+    virtual bool isFeatureEnabled(Feature feature) const override final
+    {
+        auto it = m_featurePluginsMap.find(feature);
+        if (it == m_featurePluginsMap.end())
+        {
+            return false;
+        }
+        
+        return (*it).second->context.enabled;
+    }
+
     virtual const FeatureContext* getFeatureContext(Feature feature) override final
     {
         auto it = m_featurePluginsMap.find(feature);
@@ -216,24 +218,28 @@ public:
             return &(*it).second->context;
         }
         return nullptr;
+
+
+
     }
 
-    virtual bool getExternalFeatureConfig(Feature feature, const char** configAsText) override final
+    virtual bool getExternalFeatureConfig(Feature feature, std::string& configAsText) override final
     {
         std::scoped_lock lock(m_mtxPluginConfig);
 
-        *configAsText = nullptr;
+        configAsText = "";
         auto it = m_featureExternalConfigMap.find(feature);
         if (it != m_featureExternalConfigMap.end())
         {
             auto config = (*it).second;
             if (m_externalJSONConfigs.find(feature) == m_externalJSONConfigs.end())
             {
-                m_externalJSONConfigs[feature] = new std::string;
+                m_externalJSONConfigs[feature] = std::string("");
             }
-            std::string* str = m_externalJSONConfigs[feature];
-            *str = config.dump();
-            *configAsText = str->c_str();
+            std::string& str = m_externalJSONConfigs[feature];
+            str = config.dump();
+            configAsText = std::string(str);
+
             return true;
         }
         return false;
@@ -283,13 +289,14 @@ private:
         HMODULE lib{};
         json config{};
         std::string name{};
-        std::string filename{};
-        std::string fullpath{};
+        fs::path filename{};
+        fs::path fullpath{};
         std::string paramNamespace{};
         api::PFuncOnPluginStartup* onStartup{};
         api::PFuncOnPluginShutdown* onShutdown{};
         api::PFuncGetPluginFunction* getFunction{};
         api::PFuncOnPluginLoad* onLoad{};
+        api::PFuncOnPluginsInitialized* onPluginsInitialized{};
         std::vector<std::string> requiredPlugins;
         std::vector<std::string> exclusiveHooks;
         std::vector<std::string> incompatiblePlugins;
@@ -338,8 +345,10 @@ private:
     std::wstring m_pluginPath{};
     std::vector<std::wstring> m_pathsToPlugins{};
     std::vector<Feature> m_featuresToLoad{};
-    std::map<Feature, std::string*> m_externalJSONConfigs{};
+    std::map<Feature, std::string> m_externalJSONConfigs{};
 
+    // Can only be set to true in non production builds (modified by sl.interposer JSON)
+    bool m_loadAllFeatures = false;
     Preferences m_pref{};
 
     sl::ota::IOTA* m_ota{};
@@ -478,7 +487,16 @@ Result PluginManager::findPlugins(const std::wstring& directory, std::vector<std
             // Make sure this is a dynamic library and it starts with "sl." but ignore "sl.interposer.dll"
             if (ext == dynamicLibraryExt && name.find(L"sl.") == 0 && name.find(L"sl.interposer") == std::string::npos)
             {
-                files.push_back(directory + L"/" + name + ext);
+                auto fullPath = directory + L"/" + name + ext;
+                // IMPORTANT: sl.common must be first in the list always because initialization must be executed in the correct priority order
+                if (name == L"sl.common" && !files.empty())
+                {
+                    files.insert(files.begin(), fullPath);
+                }
+                else
+                {
+                    files.push_back(fullPath);
+                }
             }
         }
     }
@@ -505,8 +523,8 @@ bool PluginManager::loadPlugin(const fs::path pluginFullPath, Plugin **ppPlugin)
     }
 
     Plugin *plugin = new Plugin();
-    plugin->fullpath = pluginFullPath.string();
-    plugin->filename = pluginFullPath.stem().string();
+    plugin->fullpath = pluginFullPath;
+    plugin->filename = pluginFullPath.stem();
     plugin->lib = mod;
     plugin->getFunction = reinterpret_cast<api::PFuncGetPluginFunction*>(GetProcAddress(mod, "slGetPluginFunction"));
     if (plugin->getFunction)
@@ -515,7 +533,7 @@ bool PluginManager::loadPlugin(const fs::path pluginFullPath, Plugin **ppPlugin)
     }
     if (!plugin->getFunction || !plugin->onLoad)
     {
-        SL_LOG_ERROR( "Ignoring '%s' since it does not contain proper API", plugin->filename.c_str());
+        SL_LOG_ERROR( "Ignoring '%ls' since it does not contain proper API", plugin->filename.wstring().c_str());
         freePlugin(&plugin);
         return false;
     }
@@ -535,7 +553,7 @@ bool PluginManager::loadPlugin(const fs::path pluginFullPath, Plugin **ppPlugin)
         const char* pluginJSONText{};
         if (!plugin->onLoad(parameters, loaderJSONStr.c_str(), &pluginJSONText))
         {
-            SL_LOG_ERROR( "Ignoring '%s' since core API 'onPluginLoad' failed", plugin->filename.c_str());
+            SL_LOG_ERROR( "Ignoring '%ls' since core API 'onPluginLoad' failed", plugin->filename.wstring().c_str());
             freePlugin(&plugin);
             return false;
         }
@@ -612,13 +630,13 @@ Result PluginManager::mapPlugins(std::vector<std::wstring>& files)
             {
                 if (p->id == plugin->id)
                 {
-                    SL_LOG_INFO("Detected two plugins with the same id %s - %s", p->filename.c_str(), plugin->filename.c_str());
+                    SL_LOG_INFO("Detected two plugins with the same id %ls - %ls", p->filename.wstring().c_str(), plugin->filename.wstring().c_str());
                     duplicatedPluginById = p;
                 }
             }
 
             // Check if plugin's id (SL feature) is requested by the host
-            bool requested = false;
+            bool requested = m_loadAllFeatures;
             for (auto f : m_featuresToLoad)
             {
                 if (f == plugin->id)
@@ -685,7 +703,7 @@ Result PluginManager::mapPlugins(std::vector<std::wstring>& files)
                         freePlugin(&duplicatedPluginById);
                         if (!loadPlugin(fullPath, &duplicatedPluginById))
                         {
-                            SL_LOG_ERROR("Failed to reload plugin file: %s it loaded before, so what happened!?", fullPath.c_str());
+                            SL_LOG_ERROR("Failed to reload plugin file: %ls it loaded before, so what happened!?", fullPath.wstring().c_str());
                             m_plugins.erase(it);
                             continue;
                         }
@@ -770,7 +788,7 @@ Result PluginManager::mapPlugins(std::vector<std::wstring>& files)
         }
         else
         {
-            SL_LOG_WARN("Failed to load plugin '%S' - last error %s", pluginFullPath.c_str(), std::system_category().message(GetLastError()).c_str());
+            SL_LOG_WARN("Failed to load plugin '%ls' - last error %s", pluginFullPath.wstring().c_str(), std::system_category().message(GetLastError()).c_str());
         }
     };
 
@@ -1032,10 +1050,6 @@ void PluginManager::unloadPlugins()
     {
         hooks.clear();
     }
-    for (auto& [feature, str] : m_externalJSONConfigs)
-    {
-        delete str;
-    }
     m_externalJSONConfigs.clear();
     // After shutdown any hook triggers will be ignored
     s_status = PluginManagerStatus::ePluginsUnloaded;
@@ -1183,7 +1197,7 @@ Result PluginManager::initializePlugins()
         // We have correct device type so generate new config
         json config;
         populateLoaderJSON(deviceType, config);
-        const auto configStr = config.dump(); // serialize to std::string
+        auto configStr = config.dump(1, ' ', false, json::error_handler_t::replace); // use indent 1 so it is easier to read in debugger
 
         SL_LOG_INFO("Initializing plugins - api %u.%u.%u - application ID %u", m_api.major, m_api.minor, m_api.build, m_appId);
 
@@ -1196,6 +1210,7 @@ Result PluginManager::initializePlugins()
 
             plugin->onStartup = reinterpret_cast<api::PFuncOnPluginStartup*>(plugin->getFunction("slOnPluginStartup"));
             plugin->onShutdown = reinterpret_cast<api::PFuncOnPluginShutdown*>(plugin->getFunction("slOnPluginShutdown"));
+            plugin->onPluginsInitialized = reinterpret_cast<api::PFuncOnPluginsInitialized*>(plugin->getFunction("slOnPluginsInitialized"));
             bool unload = false;
             if (!plugin->onStartup || !plugin->onShutdown)
             {
@@ -1226,8 +1241,24 @@ Result PluginManager::initializePlugins()
                 // Let other plugins know that this plugin is loaded and supported and on which adapters
                 auto supportedAdaptersParam = "sl.param." + plugin->paramNamespace + ".supportedAdapters";
                 parameters->set(supportedAdaptersParam.c_str(), plugin->context.supportedAdapters);
+                config["active_features"][sl::getFeatureAsStr(plugin->id)]["supportedAdapters"] = plugin->context.supportedAdapters;
             }
             processPluginHooks(plugin);
+        }
+
+        // Post init phase
+        {
+            // Config now contains list of active and initialized features with their supported adapters
+            configStr = config.dump(1, ' ', false, json::error_handler_t::replace);
+            for (auto plugin : m_plugins)
+            {
+                // Optional so check first
+                if (!plugin->onPluginsInitialized)
+                {
+                    continue;
+                }
+                plugin->onPluginsInitialized(configStr.c_str());
+            }
         }
 
         // Check for UI and register our callback
@@ -1334,6 +1365,7 @@ PluginManager::PluginManager()
     FUNCTION_HOOK_ID_MAP_ENTRY(IDXGISwapChain_Present);
     FUNCTION_HOOK_ID_MAP_ENTRY(IDXGISwapChain_Present1);
     FUNCTION_HOOK_ID_MAP_ENTRY(IDXGISwapChain_GetBuffer);
+    FUNCTION_HOOK_ID_MAP_ENTRY(IDXGISwapChain_GetDesc);
     FUNCTION_HOOK_ID_MAP_ENTRY(IDXGISwapChain_ResizeBuffers);
     FUNCTION_HOOK_ID_MAP_ENTRY(IDXGISwapChain_ResizeBuffers1);
     FUNCTION_HOOK_ID_MAP_ENTRY(IDXGISwapChain_GetCurrentBackBufferIndex);
@@ -1345,6 +1377,8 @@ PluginManager::PluginManager()
     FUNCTION_HOOK_ID_MAP_ENTRY(Vulkan_GetSwapchainImagesKHR);
     FUNCTION_HOOK_ID_MAP_ENTRY(Vulkan_AcquireNextImageKHR);
     FUNCTION_HOOK_ID_MAP_ENTRY(Vulkan_DeviceWaitIdle);
+    FUNCTION_HOOK_ID_MAP_ENTRY(Vulkan_CreateWin32SurfaceKHR);
+    FUNCTION_HOOK_ID_MAP_ENTRY(Vulkan_DestroySurfaceKHR);
 
     assert((size_t)FunctionHookID::eMaxNum == m_functionHookIDMap.size());
 

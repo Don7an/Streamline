@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -24,6 +24,7 @@
 
 #include <d3d12.h>
 #include <future>
+#include <array>
 
 #include "source/core/sl.thread/thread.h"
 #include "source/platforms/sl.chi/generic.h"
@@ -284,8 +285,8 @@ class D3D12 : public Generic
     ComputeStatus getSurfaceDriverData(Resource resource, ResourceDriverData &data, uint32_t mipOffset = 0);
     ComputeStatus getTextureDriverData(Resource resource, ResourceDriverData &data, uint32_t mipOffset = 0, uint32_t mipLevels = 0, Sampler sampler = Sampler::eSamplerPointClamp);
     ComputeStatus transitionResourceImpl(CommandList InCmdList, const ResourceTransition* transisitions, uint32_t count) override final;
-    ComputeStatus createTexture2DResourceSharedImpl(ResourceDescription& InOutResourceDesc, Resource& OutResource, bool UseNativeFormat, ResourceState InitialState) override final;
-    ComputeStatus createBufferResourceImpl(ResourceDescription& InOutResourceDesc, Resource& OutResource, ResourceState InitialState) override final;
+    ComputeStatus createTexture2DResourceSharedImpl(ResourceDescription& InOutResourceDesc, Resource& OutResource, bool UseNativeFormat, ResourceState InitialState, const char InFriendlyName[]) override final;
+    ComputeStatus createBufferResourceImpl(ResourceDescription& InOutResourceDesc, Resource& OutResource, ResourceState InitialState, const char InFriendlyName[]) override final;
 
     bool dx11On12 = false;
     bool isSupportedFormat(DXGI_FORMAT format, int flag1, int flag2);
@@ -367,7 +368,7 @@ public:
     ComputeStatus endProfilingQueue(CommandQueue cmdQueue) override final;
 
     virtual ComputeStatus notifyOutOfBandCommandQueue(CommandQueue queue, OutOfBandCommandQueueType type) override final;
-    virtual ComputeStatus setAsyncFrameMarker(CommandQueue queue, ReflexMarker marker, uint64_t frameId) override final;
+    virtual ComputeStatus setAsyncFrameMarker(CommandQueue queue, PCLMarker marker, uint64_t frameId) override final;
 
     virtual ComputeStatus createSharedHandle(Resource res, Handle& handle)  override final;
     virtual ComputeStatus destroySharedHandle(Handle& handle)  override final;

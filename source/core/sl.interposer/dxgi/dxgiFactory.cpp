@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -121,6 +121,11 @@ void setupSwapchainProxy(T*& swapchain, UINT d3dVersion, const Microsoft::WRL::C
 
     if (swapchainProxy != nullptr)
     {
+        // we're losing the ref to the swapchain here - so we're decrementing the ref count
+        if (swapchain && swapchain != swapchainProxy)
+        {
+            swapchain->Release();
+        }
         swapchain = swapchainProxy;
     }
 }

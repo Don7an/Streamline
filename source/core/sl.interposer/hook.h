@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -79,6 +79,7 @@ struct InterposerConfig
     bool forceProxies = false;
     bool forceNonNVDA = false;
     bool trackEngineAllocations = false;
+    bool enableD3D12DebugLayer = false;
     float logMessageDelayMs = 5000.0f;
     uint32_t logLevel = 2;
     std::string logPath{};
@@ -116,6 +117,7 @@ struct IHook
 
 #endif
 
+bool hasInterface();
 IHook* getInterface();
 void destroyInterface();
 

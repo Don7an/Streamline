@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -34,14 +34,24 @@ namespace sl
 namespace api
 {
 
-//! Plugin specific context
+//! Plugin specific context, with default consturctor and destructor
 //! 
 //! NOTE: Instance of this context is valid for the entire life-cycle of a plugin since it cannot
 //! be destroyed anywhere else other than in DLLMain when plugin is detached from the process.
 //! 
 #define SL_PLUGIN_CONTEXT_CREATE_DESTROY(NAME)                                  \
 protected:                                                                      \
-    NAME() {};                                                                  \
+    NAME() {onCreateContext();};                                                \
+    /* Called on exit from DLL */                                               \
+    ~NAME() {onDestroyContext();};                                              \
+    friend BOOL APIENTRY ::DllMain(HMODULE hModule, DWORD fdwReason, LPVOID);   \
+public:                                                                         \
+    NAME(const NAME& rhs) = delete;
+
+//! Plugin specific context, same as above except constructor is not auto-defined
+//! 
+#define SL_PLUGIN_CONTEXT_DESTROY_ONLY(NAME)                                    \
+protected:                                                                      \
     /* Called on exit from DLL */                                               \
     ~NAME() {onDestroyContext();};                                              \
     friend BOOL APIENTRY ::DllMain(HMODULE hModule, DWORD fdwReason, LPVOID);   \
@@ -77,6 +87,8 @@ class Context
     };
 
     SL_PLUGIN_CONTEXT_CREATE_DESTROY(Context);
+
+    void onCreateContext() {};
 
     void onDestroyContext()
     {
@@ -180,6 +192,14 @@ SL_EXPORT BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)       
     return TRUE;                                                                                           \
 }                                                                                                          \
 namespace sl {
+
+//! Check if plugin correctly initialized via slOnPluginLoad and slOnPluginStartup
+//! Intended to be used at the top of exported plugin functions like slGet/SetData, etc.
+#define SL_PLUGIN_INIT_CHECK() do {                                                                         \
+        if (!api::getContext()->parameters /*slOnPluginLoad*/                                               \
+        || !api::getContext()->device /*slOnPluginStartup > SL_PLUGIN_COMMON_STARTUP*/                      \
+        ){  return Result::eErrorNotInitialized; }                                                          \
+    } while(false)
 
 } // namespace api
 

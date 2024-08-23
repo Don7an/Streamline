@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -22,6 +22,9 @@
 
 #pragma once
 
+#if SL_WINDOWS
+#include <windows.h>
+#endif
 #include <string>
 #include <vector>
 #include <functional>
@@ -33,6 +36,8 @@
 #include <cmath>
 #include <codecvt>
 #include <locale>
+#include <iomanip>
+#include <array>
 
 #ifdef SL_WINDOWS
 #define SL_IGNOREWARNING_PUSH __pragma(warning(push))
@@ -103,6 +108,13 @@ std::string toHexStr(I w, size_t hex_len = sizeof(I) << 1)
     return rc;
 }
 
+inline std::string threadIdToString(const std::thread::id& id)
+{
+    std::ostringstream oss;
+    oss << id;
+    return oss.str();
+}
+
 inline constexpr uint32_t align(uint32_t size, uint32_t alignment)
 {
     return (size + (alignment - 1)) & ~(alignment - 1);
@@ -127,18 +139,83 @@ inline bool setEnvVar(const char* varName, const char* value)
     return result;
 }
 
+#if SL_WINDOWS
+inline bool getRegistryDword(const WCHAR *InRegKeyHive, const WCHAR *InRegKeyName, DWORD *OutValue)
+{
+    HKEY Key;
+    LONG Res = RegOpenKeyExW(HKEY_LOCAL_MACHINE, InRegKeyHive, 0, KEY_READ, &Key);
+    if (Res == ERROR_SUCCESS)
+    {
+        DWORD dwordSize = sizeof(DWORD);
+        Res = RegGetValueW(Key, NULL, InRegKeyName, RRF_RT_REG_DWORD, NULL, (LPBYTE)OutValue, &dwordSize);
+        RegCloseKey(Key);
+        if (Res == ERROR_SUCCESS)
+        {
+            return true;
+        }
+    }
+    return false;
+};
+
+inline bool getRegistryString(const WCHAR *InRegKeyHive, const WCHAR *InRegKeyName, WCHAR *OutValue, DWORD InCountValue)
+{
+    HKEY Key;
+    LONG Res = RegOpenKeyExW(HKEY_LOCAL_MACHINE, InRegKeyHive, 0, KEY_READ, &Key);
+    if (Res == ERROR_SUCCESS)
+    {
+        DWORD bufferSize = sizeof(WCHAR) * InCountValue;
+        Res = RegGetValueW(Key, NULL, InRegKeyName, RRF_RT_REG_SZ, NULL, (LPBYTE)OutValue, &bufferSize);
+        RegCloseKey(Key);
+        if (Res == ERROR_SUCCESS)
+        {
+            return true;
+        }
+    }
+    return false;
+};
+#endif
+
+// Returns a microseconds string as seconds:mseconds:useconds
+inline std::string prettifyMicrosecondsString(const uint64_t microseconds)
+{
+    auto tmp = microseconds;
+
+    // Calculate seconds, milliseconds, and remaining microseconds
+    uint64_t seconds = tmp / 1000000;
+    tmp %= 1000000;
+    uint64_t milliseconds = tmp / 1000;
+    tmp %= 1000;
+
+    // Format the result
+    std::ostringstream formattedTime;
+    formattedTime << seconds << "s:" << std::setw(3) << std::setfill('0') << milliseconds << "ms:" << std::setw(3) << std::setfill('0') << tmp << "us";
+    return formattedTime.str();
+}
+
+static inline std::chrono::high_resolution_clock::time_point s_timeSinceBegin = std::chrono::high_resolution_clock::now();
+
+// Records a timestamp and returns it as a seconds:mseconds:useconds string
+inline std::string getPrettyTimestamp()
+{
+    std::chrono::duration<uint64_t, std::micro> sinceInit = std::chrono::duration_cast<std::chrono::duration<uint64_t, std::micro>>
+                                                                           (std::chrono::high_resolution_clock::now() - s_timeSinceBegin);
+    return prettifyMicrosecondsString(sinceInit.count());
+}
+
 struct ScopedTasks
 {
     ScopedTasks() {};
     ScopedTasks(std::function<void(void)> funIn, std::function<void(void)> funOut) { funIn();  tasks.push_back(funOut); }
     ScopedTasks(std::function<void(void)> fun) { tasks.push_back(fun); }
-    ~ScopedTasks()
+    void execute()
     {
         for (auto& task : tasks)
         {
             task();
         }
+        tasks.clear();
     }
+    ~ScopedTasks() { execute(); }
     std::vector<std::function<void(void)>> tasks;
 };
 
@@ -197,23 +274,24 @@ constexpr size_t kAverageMeterWindowSize = 120;
 //! IMPORTANT: Mainly not thread safe for performance reasons
 //! 
 //! Only selected "get" methods use atomics.
-struct AverageValueMeter
+template <uint32_t WINDOW_SIZE>
+struct TAverageValueMeter
 {
-    AverageValueMeter()
+    TAverageValueMeter()
     {
 #ifdef SL_WINDOWS
         QueryPerformanceFrequency(&frequency);
 #endif
     };
 
-    AverageValueMeter(const AverageValueMeter& rhs) { operator=(rhs); }
+    TAverageValueMeter(const TAverageValueMeter& rhs) { operator=(rhs); }
 
-    inline AverageValueMeter& operator=(const AverageValueMeter& rhs)
+    inline TAverageValueMeter& operator=(const TAverageValueMeter& rhs)
     {
         n = rhs.n.load();
         val = rhs.val.load();
         sum = rhs.sum;
-        memcpy(window, rhs.window, sizeof(double) * kAverageMeterWindowSize);
+        window = rhs.window;
 #ifdef SL_WINDOWS
         frequency = rhs.frequency;
         startTime = rhs.startTime;
@@ -229,7 +307,7 @@ struct AverageValueMeter
         val = 0;
         sum = 0;
         mean = 0;
-        memset(window, 0, sizeof(double) * kAverageMeterWindowSize);
+        std::fill(window.begin(), window.end(), 0);
 #ifdef SL_WINDOWS
         startTime = {};
         elapsedUs = {};
@@ -295,27 +373,28 @@ struct AverageValueMeter
     {
         val = value;
         sum = sum + value;
-        auto i = n.load() % kAverageMeterWindowSize;
-        if (n >= kAverageMeterWindowSize)
+        auto i = n.load() % window.size();
+        if (n >= window.size())
         {
             sum = sum - window[i];
         }
         window[i] = value;
         n++;
-        mean = sum / double(std::min(n.load(), kAverageMeterWindowSize));
+        mean = sum / double(std::min(n.load(), (uint64_t)window.size()));
     }
 
     //! NOT thread safe
     double getMedian()
     {
-        double median = 0;
-        if (n > 0)
+        if (n == 0) return 0.;
+        std::vector<double> tmp(window.begin(), window.begin() + std::min(n.load(), (uint64_t)window.size()));
+        std::sort(tmp.begin(), tmp.end());
+        uint32_t i = ((uint32_t)tmp.size()) / 2;
+        if (i * 2 != tmp.size()) // tmp has an odd number of elements?
         {
-            std::vector<double> tmp(window, window + std::min(n.load(),kAverageMeterWindowSize));
-            std::sort(tmp.begin(), tmp.end());
-            median = tmp[tmp.size() / 2];
+            return tmp[i];
         }
-        return median;
+        return (tmp[i] + tmp[i - 1]) / 2;
     }
 
     //! NOT thread safe
@@ -340,7 +419,7 @@ private:
     std::atomic<uint64_t> n = 0;
 
     double sum{};
-    double window[kAverageMeterWindowSize];
+    std::array<double, WINDOW_SIZE> window;
 
 #ifdef SL_WINDOWS
     LARGE_INTEGER frequency{};
@@ -348,6 +427,7 @@ private:
     LARGE_INTEGER elapsedUs{};
 #endif
 };
+typedef TAverageValueMeter<kAverageMeterWindowSize> AverageValueMeter;
 
 struct ScopedCPUTimer
 {

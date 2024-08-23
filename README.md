@@ -1,4 +1,4 @@
-# Streamline (SL) - Version 2.1.0
+# Streamline (SL) - Version 2.4.11
 
 Streamline is an open-sourced cross-IHV solution that simplifies integration of the latest NVIDIA and other independent hardware vendors’ super resolution technologies into applications and games. This framework allows developers to easily implement one single integration and enable multiple super-resolution technologies and other graphics effects supported by the hardware vendor.
 
@@ -48,7 +48,7 @@ Running the `setup.bat` script will cause two things to be done:
 
 To build the project, simply open `_project\vs2017\streamline.sln` in Visual Studio, select the desired build configuration and build, or else use the provided build script:
 
-`./build.bat` with `-{debug|release|production}` (`debug` is default) or use VS IDE and load solution from the `_project` directory
+`./build.bat` with `-{debug|develop|production}` (`debug` is default) or use VS IDE and load solution from the `_project` directory
 
 The default setting is to target x86_64 CPU architecture.
 
@@ -73,23 +73,20 @@ Obviously, `sl.dlss_g.dll` cannot be built from source and thus the prebuilt cop
 
 #### (Optional) Compiling Shaders
 
-Most users will not need to compile shaders as they are provided pre-compiled.  If you need to compile HLSL shaders for your own plugin, you will need to place slang in the .\external\slang_internal folder and xxd in the .\tools folder.  Then any *.hlsl files in the .\shaders folder will be compiled at build time.  Without these tools in place, the precompiled versions of the shaders in `_artifacts\shaders\` will be used, even if the source shaders are edited.
-
-Additionally, if you would like to recompile the shaders for the NIS plugin, you will need to have Python 3 installed and in the path.
-
-Slang may be found at https://github.com/shader-slang/slang
-
-xxd may be found at https://sourceforge.net/projects/xxd-for-windows/
+If you would like to recompile the shaders for the NIS plugin, you will need to have Python 3 installed and in the path.
 
 ## SDK Packaging
 
-- Execute `./package.bat` with `-{debug|release|production}` (`production` is default)
+- Execute `./package.bat` with `-{debug|develop|production}` (`production` is default)
 
 The packaged SDK can be found in the generated `_sdk` folder.
 
 ## Debugging
 
-Please read [Debugging.md](docs/Debugging.md) to learn how to debug and troubleshoot issues.
+Streamline offers several ways to debug and troubleshoot issues. Please see the following pages for more information.
+* Using SL ImGui: [Debugging - SL ImGUI (Realtime Data Inspection).md](docs/Debugging - SL ImGUI %28Realtime Data Inspection%29.md)
+* Using JSON configuration files: [Debugging - JSON Configs (Plugin Configs).md](docs/Debugging - JSON Configs %28Plugin Configs%29.md)
+* Using NRD's validation layer: [Debugging - NRD.md](docs/Debugging - NRD.md)
 
 ## General Programming Guide
 
@@ -114,3 +111,4 @@ A sample Streamline plugin source code is located [here](source/plugins/sl.templ
 ## Sample App and Source
 
 A sample application using Streamline may be found in [this git repo](https://github.com/NVIDIAGameWorks/Streamline_Sample)
+

@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -24,13 +24,15 @@
 
 #include <string.h>
 
+#define FEATURE_SPECIFIC_BUFFER_TYPE_ID(feature, number) feature << 16 | number
+
 #include "sl.h"
 #include "sl_consts.h"
 #include "sl_reflex.h"
+#include "sl_pcl.h"
 #include "sl_dlss.h"
 #include "sl_nis.h"
 #include "sl_nrd.h"
-#include "sl_dlss_g.h"
 
 namespace sl
 {
@@ -90,6 +92,7 @@ inline const char* getResultAsStr(Result v)
         SL_CASE_STR(Result::eErrorFeatureMissingDependency);
         SL_CASE_STR(Result::eErrorFeatureManagerInvalidState);
         SL_CASE_STR(Result::eErrorInvalidState);
+        SL_CASE_STR(Result::eWarnOutOfVRAM);
     };
     return "Unknown";
 }
@@ -148,23 +151,22 @@ inline const char* getReflexModeAsStr(ReflexMode mode)
     return "Unknown";
 }
 
-inline const char* getReflexMarkerAsStr(ReflexMarker marker)
+inline const char* getPCLMarkerAsStr(PCLMarker marker)
 {
     switch (marker)
     {
-        SL_CASE_STR(ReflexMarker::eSimulationStart);
-        SL_CASE_STR(ReflexMarker::eSimulationEnd);
-        SL_CASE_STR(ReflexMarker::eRenderSubmitStart);
-        SL_CASE_STR(ReflexMarker::eRenderSubmitEnd);
-        SL_CASE_STR(ReflexMarker::ePresentStart);
-        SL_CASE_STR(ReflexMarker::ePresentEnd);
-        SL_CASE_STR(ReflexMarker::eInputSample);
-        SL_CASE_STR(ReflexMarker::eTriggerFlash);
-        SL_CASE_STR(ReflexMarker::ePCLatencyPing);
-        SL_CASE_STR(ReflexMarker::eOutOfBandRenderSubmitStart);
-        SL_CASE_STR(ReflexMarker::eOutOfBandRenderSubmitEnd);
-        SL_CASE_STR(ReflexMarker::eOutOfBandPresentStart);
-        SL_CASE_STR(ReflexMarker::eOutOfBandPresentEnd);
+        SL_CASE_STR(PCLMarker::eSimulationStart);
+        SL_CASE_STR(PCLMarker::eSimulationEnd);
+        SL_CASE_STR(PCLMarker::eRenderSubmitStart);
+        SL_CASE_STR(PCLMarker::eRenderSubmitEnd);
+        SL_CASE_STR(PCLMarker::ePresentStart);
+        SL_CASE_STR(PCLMarker::ePresentEnd);
+        SL_CASE_STR(PCLMarker::eTriggerFlash);
+        SL_CASE_STR(PCLMarker::ePCLatencyPing);
+        SL_CASE_STR(PCLMarker::eOutOfBandRenderSubmitStart);
+        SL_CASE_STR(PCLMarker::eOutOfBandRenderSubmitEnd);
+        SL_CASE_STR(PCLMarker::eOutOfBandPresentStart);
+        SL_CASE_STR(PCLMarker::eOutOfBandPresentEnd);
     };
     return "Unknown";
 }
@@ -226,6 +228,22 @@ inline const char* getBufferTypeAsStr(BufferType buf)
         SL_CASE_STR(kBufferTypeOpaqueColor);
         SL_CASE_STR(kBufferTypeReactiveMaskHint);
         SL_CASE_STR(kBufferTypeTransparencyAndCompositionMaskHint);
+        SL_CASE_STR(kBufferTypeReflectedAlbedo);
+        SL_CASE_STR(kBufferTypeColorBeforeParticles);
+        SL_CASE_STR(kBufferTypeColorBeforeTransparency);
+        SL_CASE_STR(kBufferTypeColorBeforeFog);
+        SL_CASE_STR(kBufferTypeSpecularHitDistance);
+        SL_CASE_STR(kBufferTypeSpecularRayDirectionHitDistance);
+        SL_CASE_STR(kBufferTypeSpecularRayDirection);
+        SL_CASE_STR(kBufferTypeDiffuseHitDistance);
+        SL_CASE_STR(kBufferTypeDiffuseRayDirectionHitDistance);
+        SL_CASE_STR(kBufferTypeDiffuseRayDirection);
+        SL_CASE_STR(kBufferTypeHiResDepth);
+        SL_CASE_STR(kBufferTypeLinearDepth);
+        SL_CASE_STR(kBufferTypeBidirectionalDistortionField);
+        SL_CASE_STR(kBufferTypeTransparencyLayer);
+        SL_CASE_STR(kBufferTypeTransparencyLayerOpacity);
+        SL_CASE_STR(kBufferTypeBackbuffer);
     };
     return "Unknown";
 }
@@ -238,9 +256,13 @@ inline const char* getFeatureAsStr(Feature f)
         SL_CASE_STR(kFeatureNRD);
         SL_CASE_STR(kFeatureNIS);
         SL_CASE_STR(kFeatureReflex);
+        SL_CASE_STR(kFeaturePCL);
         SL_CASE_STR(kFeatureDLSS_G);
+        SL_CASE_STR(kFeatureNvPerf);
         SL_CASE_STR(kFeatureImGUI);
         SL_CASE_STR(kFeatureCommon);
+        SL_CASE_STR(kFeatureDLSS_RR);
+        SL_CASE_STR(kFeatureDeepDVC);
     }
     return "Unknown";
 }
@@ -255,9 +277,13 @@ inline const char* getFeatureFilenameAsStrNoSL(Feature f)
         case kFeatureNRD:  return "nrd";
         case kFeatureNIS: return "nis";
         case kFeatureReflex: return "reflex";
+        case kFeaturePCL: return "pcl";
         case kFeatureDLSS_G: return "dlss_g";
+        case kFeatureNvPerf: return "nvperf";
+        case kFeatureDeepDVC: return "deepdvc";        
         case kFeatureImGUI: return "imgui";
         case kFeatureCommon: return "common";
+        case kFeatureDLSS_RR: return "dlss_d";
         default: return "Unknown";
     }
 }
@@ -284,6 +310,7 @@ inline const char* getResourceTypeAsStr(ResourceType v)
         SL_CASE_STR(ResourceType::eCommandPool);
         SL_CASE_STR(ResourceType::eFence);
         SL_CASE_STR(ResourceType::eSwapchain);
+        SL_CASE_STR(ResourceType::eHostFence);
     };
     return "Unknown";
 }

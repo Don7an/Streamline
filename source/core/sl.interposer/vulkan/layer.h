@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -28,13 +28,22 @@
 #include "external/vulkan/include/vulkan/vk_layer.h"
 #include "external/vulkan/include/vulkan/vk_layer_dispatch_table.h"
 
-//#include "vulkannv.h"
+#include "vulkannv.h"
 
 namespace sl
 {
 
 namespace interposer
 {
+
+struct QueueVkInfo
+{
+    VkQueueFlags flags{};
+    uint32_t familyIndex{};
+    uint32_t index{};
+    VkDeviceQueueCreateFlags createFlags{};
+    uint32_t count{};
+};
 
 struct VkTable
 {
@@ -46,12 +55,16 @@ struct VkTable
 
     uint32_t computeQueueIndex = 0;
     uint32_t computeQueueFamily = 0;
+    uint32_t computeQueueCreateFlags = 0;
     uint32_t graphicsQueueIndex = 0;
     uint32_t graphicsQueueFamily = 0;
+    uint32_t graphicsQueueCreateFlags = 0;
     uint32_t opticalFlowQueueIndex = 0;
     uint32_t opticalFlowQueueFamily = 0;
+    uint32_t opticalFlowQueueCreateFlags = 0;
 
     bool nativeOpticalFlowHWSupport = false;
+    std::vector<QueueVkInfo> hostGraphicsComputeQueueInfo{};
 
     std::mutex mutex;
     std::map<void*, VkLayerInstanceDispatchTable> dispatchInstanceMap;
@@ -70,8 +83,8 @@ struct VkTable
     PFN_vkGetImageViewHandleNVX vkGetImageViewHandleNVX;
 };
 
-#define SL_GIPR(F) dt.##F = (PFN_vk##F)getInstanceProcAddr(instance, "vk" #F)
-#define SL_GDPR(F) dt.##F = (PFN_vk##F)getDeviceProcAddr(device, "vk" #F)
+#define SL_GIPR(F) dt.F = (PFN_vk##F)getInstanceProcAddr(instance, "vk" #F)
+#define SL_GDPR(F) dt.F = (PFN_vk##F)getDeviceProcAddr(device, "vk" #F)
 
 inline void VkTable::mapVulkanInstanceAPI(VkInstance instance)
 {

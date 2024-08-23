@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -25,7 +25,7 @@
 #include "source/core/sl.param/parameters.h"
 #include "source/core/sl.security/secureLoadLibrary.h"
 #include "shaders/vulkan_clear_image_view_spirv.h"
-#include "external/reflex-sdk-vk/inc/NvLowLatencyVk.h"
+#include "nvllvk.h"
 #include "external/vulkan/include/vulkan/vulkan_win32.h"
 
 // Errors are negative so don't check for VK_SUCCESS only since there are other 'non fatal' values > 0, we show them as warnings
@@ -37,7 +37,7 @@
 #define VK_CHECK_RE(res, f) res = f;if(res < 0){SL_LOG_ERROR("%s failed - error %d",#f,res); return res;} else if(res != 0) {SL_LOG_WARN("%s - warning %d",#f,res);}
 #define VK_CHECK_RWS(f) {auto _r = f;if(_r < 0){SL_LOG_ERROR("%s failed - error %d",#f,_r); return WaitStatus::eError;} else if(_r == VK_TIMEOUT) {SL_LOG_WARN("%s - timed out", #f); return WaitStatus::eTimeout;}}
 
-#define LL_CHECK(f) {auto _r = f;if(_r != NvLL_VK_Status::NVLL_VK_OK){SL_LOG_ERROR( "%s failed - error %u",#f,_r); return ComputeStatus::eError;}}
+#define CHECK_REFLEX() do { if (!m_reflex){ SL_LOG_WARN_ONCE("No reflex"); return ComputeStatus::eError; } } while(false)
 
 namespace sl
 {
@@ -50,7 +50,23 @@ ICompute *getVulkan()
     return &s_vulkan;
 }
 
-constexpr uint64_t kMaxSemaphoreWaitUs = 500000000; // 500ms max wait on any semaphore;
+void KernelDataVK::destroy(const VkLayerDispatchTable& ddt, VkDevice device)
+{
+    if (pipeline)
+    {
+        ddt.DestroyPipeline(device, pipeline, nullptr);
+        ddt.DestroyPipelineLayout(device, pipelineLayout, nullptr);
+        ddt.DestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
+    }
+    if (shaderModule)
+    {
+        ddt.DestroyShaderModule(device, shaderModule, nullptr);
+    }
+    pipeline = VK_NULL_HANDLE;
+    pipelineLayout = VK_NULL_HANDLE;
+    descriptorSetLayout = VK_NULL_HANDLE;
+    shaderModule = VK_NULL_HANDLE;
+}
 
 class CommandListContextVK : public ICommandListContext
 {
@@ -67,7 +83,9 @@ class CommandListContextVK : public ICommandListContext
     ICompute* m_compute = {};
     VkQueue m_cmdQueue;
     VkSemaphore m_presentSemaphore{};
-    VkSemaphore m_acquireSemaphore{};
+    std::vector<VkSemaphore> m_acquireSemaphore{};  // binary semaphore correspondng to each swapchain buffer passed to swapchain-acquisition VK API.
+    std::vector<VkFence> m_acquireFence{}; // Host-side (CPU) fence correspondng to each swapchain buffer passed to swapchain-acquisition to be able to do CPU wait.
+    uint32_t m_acquireIndex{}; // indexes into m_acquireSemaphore and m_acquireFence list.
     std::vector<VkCommandBuffer> m_cmdBuffer;
     std::vector<VkCommandPool> m_allocator;
     std::vector<VkSemaphore> m_fence;
@@ -97,6 +115,9 @@ public:
         m_name = extra::utf8ToUtf16(debugName);
         m_cmdQueue = (VkQueue)queue->native;
         m_bufferCount = count;
+        m_acquireSemaphore.resize(m_bufferCount);
+        m_acquireFence.resize(m_bufferCount);
+        m_acquireIndex = m_bufferCount - 1;
         // Allocate double, see below why
         m_clCount = m_bufferCount * 2;
         m_allocator.resize(m_clCount);
@@ -109,15 +130,30 @@ public:
         createInfo.pNext = {};
         createInfo.flags = 0;
         VK_CHECK_RV(m_ddt.CreateSemaphore(dev, &createInfo, NULL, &m_presentSemaphore));
-        VK_CHECK_RV(m_ddt.CreateSemaphore(dev, &createInfo, NULL, &m_acquireSemaphore));
-
-        sl::Resource r;
+        sl::Resource r{};
+        r.type = (ResourceType)ResourceType::eFence;
         r.native = m_presentSemaphore;
-        r.type = (ResourceType)ResourceType::eFence;
-        m_compute->setDebugName(&r, "present_semaphore");
-        r.native = m_acquireSemaphore;
-        r.type = (ResourceType)ResourceType::eFence;
-        m_compute->setDebugName(&r, "acquire_semaphore");
+        m_compute->setDebugName(&r, "SL_present_semaphore");
+
+        VkFenceCreateInfo fenceCreateinfo = {};
+        fenceCreateinfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        fenceCreateinfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        for (uint32_t i = 0; i < m_bufferCount; i++)
+        {
+            VK_CHECK_RV(m_ddt.CreateSemaphore(dev, &createInfo, NULL, &m_acquireSemaphore[i]));
+            r.type = (ResourceType)ResourceType::eFence;
+            r.native = m_acquireSemaphore[i];
+            std::stringstream name{};
+            name << "SL_acquire_semaphore_" << i;
+            m_compute->setDebugName(&r, name.str().c_str());
+
+            VK_CHECK_RV(m_ddt.CreateFence(dev, &fenceCreateinfo, NULL, &m_acquireFence[i]));
+            r.type = (ResourceType)ResourceType::eHostFence;
+            r.native = m_acquireFence[i];
+            name = std::stringstream{};
+            name << "SL_acquire_fence_" << i;
+            m_compute->setDebugName(&r, name.str().c_str());
+        }
 
         SL_LOG_INFO("Creating command context %s - cmd buffers %u - dummy cmd buffers %u", debugName, m_bufferCount, m_clCount - m_bufferCount);
 
@@ -171,17 +207,29 @@ public:
 
     void shutdown()
     {
-        m_ddt.DestroySemaphore(m_device, m_presentSemaphore, nullptr);
-        m_ddt.DestroySemaphore(m_device, m_acquireSemaphore, nullptr);
+        assert(m_device != NULL);
+
         for (uint32_t i = 0; i < 2 * m_bufferCount; i++)
         {
             m_ddt.FreeCommandBuffers(m_device, m_allocator[i], 1, &m_cmdBuffer[i]);
             m_ddt.DestroyCommandPool(m_device, m_allocator[i], nullptr);
             m_ddt.DestroySemaphore(m_device, m_fence[i], nullptr);
         }
+
+        for (uint32_t i = 0; i < m_bufferCount; i++)
+        {
+            m_ddt.DestroyFence(m_device, m_acquireFence[i], NULL);
+            m_ddt.DestroySemaphore(m_device, m_acquireSemaphore[i], nullptr);
+        }
+
+        m_ddt.DestroySemaphore(m_device, m_presentSemaphore, nullptr);
+
         m_cmdBuffer.clear();
-        m_allocator.clear();
+        m_fenceValue.clear();
         m_fence.clear();
+        m_allocator.clear();
+        m_acquireFence.clear();
+        m_acquireSemaphore.clear();
     }
 
     RenderAPI getType() { return RenderAPI::eVulkan; }
@@ -321,9 +369,10 @@ public:
         return WaitStatus::eNoTimeout;
     }
 
-    uint32_t getBufferCount()
+    uint32_t getPrevCommandListIndex() override
     {
-        return m_bufferCount;
+        assert(m_bufferCount > 0); // can't call this if you don't have any buffers
+        return (m_index + m_bufferCount - 1) % m_bufferCount;
     }
 
     uint32_t getCurrentCommandListIndex()
@@ -340,10 +389,15 @@ public:
     {
         return m_fenceValue[idx];
     }
-    
-    SyncPoint getNextSyncPoint()
+
+    SyncPoint getSyncPointAtIndex(uint32_t idx) override
     {
-        return { m_fence[m_index], m_fenceValue[m_index] + 1 };
+        return { m_fence[idx], m_fenceValue[idx] };
+    }
+
+    Fence getNextVkAcquireFence() override final
+    {
+        return m_acquireFence[m_acquireIndex];
     }
 
     bool signalAllWaitingOnQueues()
@@ -388,6 +442,14 @@ public:
         }
         //SL_LOG_INFO("Flushing on %S index %u value %llu", name.c_str(), i, fenceValue[i]);
         return WaitStatus::eNoTimeout;
+    }
+
+    uint64_t getCompletedValue(Fence fence)
+    {
+        auto semaphore = (VkSemaphore)fence;
+        uint64_t completedValue = 0;
+        VK_CHECK_RF(m_ddt.GetSemaphoreCounterValue(m_device, semaphore, &completedValue));
+        return completedValue;
     }
 
     bool didCommandListFinish(uint32_t index)
@@ -499,20 +561,21 @@ public:
         VK_CHECK_RV(m_ddt.QueueSubmit(m_cmdQueue, 1, &submitInfo, nullptr));
     }
 
-    void signalGPUFenceAt(uint32_t index)
+    bool signalGPUFenceAt(uint32_t index) override
     {
-        signalGPUFence(m_fence[index], ++m_fenceValue[m_index]);
+        return signalGPUFence(m_fence[index], ++m_fenceValue[m_index]);
     }
 
-    void signalGPUFence(Fence fence, uint64_t syncValue)
+    bool signalGPUFence(Fence fence, uint64_t syncValue) override
     {
         GPUSyncInfo info;
         info.signalSemaphores = { (VkSemaphore)fence };
         info.signalValues = { syncValue };
         syncGPU(&info);
+        return true;
     }
 
-    void waitGPUFence(Fence fence, uint64_t syncValue)
+    void waitGPUFence(Fence fence, uint64_t syncValue, const DebugInfo &debugInfo) override
     {
         GPUSyncInfo info;
         info.waitSemaphores = { (VkSemaphore)fence };
@@ -520,7 +583,8 @@ public:
         syncGPU(&info);
     }
 
-    void waitOnGPUForTheOtherQueue(const ICommandListContext* other, uint32_t clIndex, uint64_t syncValue)
+    void waitOnGPUForTheOtherQueue(const ICommandListContext* other, uint32_t clIndex,
+        uint64_t syncValue, const DebugInfo &debugInfo) override
     {
         auto tmp = (const CommandListContextVK*)other;
         if (!tmp || tmp->m_cmdQueue == m_cmdQueue) return;
@@ -597,11 +661,15 @@ public:
         bufferIndex = UINT32_MAX;
         // With VK it is important to always return the "error" code
         int res{};
-        VK_CHECK_RE(res, m_ddt.AcquireNextImageKHR(m_device, (VkSwapchainKHR)sc->native, timeout, m_acquireSemaphore, nullptr, &bufferIndex));
+        m_acquireIndex = (m_acquireIndex + 1) % m_bufferCount;
+        // CPU wait not possible with binary semaphores, hence needing corresponding host fence.
+        VK_CHECK_RE(res, m_ddt.WaitForFences(m_device, 1, &m_acquireFence[m_acquireIndex], VK_TRUE, timeout));
+        VK_CHECK_RE(res, m_ddt.ResetFences(m_device, 1, &m_acquireFence[m_acquireIndex]));
+        VK_CHECK_RE(res, m_ddt.AcquireNextImageKHR(m_device, (VkSwapchainKHR)sc->native, timeout, m_acquireSemaphore[m_acquireIndex], nullptr, &bufferIndex));
         m_bufferToPresent = bufferIndex;
         if (waitSemaphore)
         {
-            *waitSemaphore = m_acquireSemaphore;
+            *waitSemaphore = m_acquireSemaphore[m_acquireIndex];
         }
         return res;
     }
@@ -654,86 +722,164 @@ inline VkImageLayout toVkImageLayout(ResourceState state)
 {
     switch (state)
     {
-        case ResourceState::eUndefined: return VK_IMAGE_LAYOUT_UNDEFINED;
+        default:
         case ResourceState::eGeneral: return VK_IMAGE_LAYOUT_GENERAL;
-        case ResourceState::eVertexBuffer: return VK_IMAGE_LAYOUT_GENERAL;
-        case ResourceState::eIndexBuffer: return VK_IMAGE_LAYOUT_GENERAL;
-        case ResourceState::eConstantBuffer: return VK_IMAGE_LAYOUT_GENERAL;
-        case ResourceState::eArgumentBuffer: return VK_IMAGE_LAYOUT_GENERAL;
         case ResourceState::eTextureRead: return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        case ResourceState::eStorageRead: return VK_IMAGE_LAYOUT_GENERAL;
-        case ResourceState::eStorageWrite: return VK_IMAGE_LAYOUT_GENERAL;
-        case ResourceState::eStorageRW: return VK_IMAGE_LAYOUT_GENERAL;
-        case ResourceState::eColorAttachmentRead: return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        case ResourceState::eColorAttachmentWrite: return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        case ResourceState::eDepthStencilAttachmentWrite: return VK_IMAGE_LAYOUT_GENERAL;
+        case ResourceState::eColorAttachmentRead:
+        case ResourceState::eColorAttachmentWrite:
+        case ResourceState::eColorAttachmentRW: return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         case ResourceState::eDepthStencilAttachmentRead: return VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-        case ResourceState::eCopySource: return VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        case ResourceState::eCopyDestination: return VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        case ResourceState::eAccelStructRead: return VK_IMAGE_LAYOUT_GENERAL;
-        case ResourceState::eAccelStructWrite: return VK_IMAGE_LAYOUT_GENERAL;
-        case ResourceState::eResolveSource: return VK_IMAGE_LAYOUT_GENERAL;
-        case ResourceState::eResolveDestination: return VK_IMAGE_LAYOUT_GENERAL;
+        case ResourceState::eDepthStencilAttachmentWrite:
+        case ResourceState::eDepthStencilAttachmentRW: return VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        case ResourceState::eCopySource:
+        case ResourceState::eResolveSource: return VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        case ResourceState::eCopyDestination:
+        case ResourceState::eResolveDestination: return VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         case ResourceState::ePresent: return VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    };
-    return VK_IMAGE_LAYOUT_GENERAL;
+        case ResourceState::eUndefined: return VK_IMAGE_LAYOUT_UNDEFINED;
+    }
 };
 
 VkAccessFlags toVkAccessFlags(ResourceState state)
 {
-    VkAccessFlags flags = 0;
-
     switch (state)
     {
-    case ResourceState::eVertexBuffer: return VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
-    case ResourceState::eIndexBuffer: return VK_ACCESS_INDEX_READ_BIT;
-    case ResourceState::eConstantBuffer: return VK_ACCESS_UNIFORM_READ_BIT;
-    case ResourceState::eArgumentBuffer: return VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
-    case ResourceState::eTextureRead: return VK_ACCESS_SHADER_READ_BIT;
-    case ResourceState::eStorageRead: return VK_ACCESS_SHADER_READ_BIT;
-    case ResourceState::eStorageWrite: return VK_ACCESS_SHADER_WRITE_BIT;
-    case ResourceState::eStorageRW: return VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    case ResourceState::eColorAttachmentRead: return VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-    case ResourceState::eColorAttachmentWrite: return VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    case ResourceState::eDepthStencilAttachmentWrite: return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    case ResourceState::eDepthStencilAttachmentRead: return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-    case ResourceState::eCopySource: return VK_ACCESS_TRANSFER_READ_BIT;
-    case ResourceState::eCopyDestination: return VK_ACCESS_TRANSFER_WRITE_BIT;
-    case ResourceState::eAccelStructRead: return VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-    case ResourceState::eAccelStructWrite: return VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-    case ResourceState::eResolveSource: return VK_ACCESS_TRANSFER_READ_BIT;
-    case ResourceState::eResolveDestination: return VK_ACCESS_TRANSFER_WRITE_BIT;
-    };
-    return flags;
+        case ResourceState::eVertexBuffer: return VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+        case ResourceState::eIndexBuffer: return VK_ACCESS_INDEX_READ_BIT;
+        case ResourceState::eConstantBuffer: return VK_ACCESS_UNIFORM_READ_BIT;
+        case ResourceState::eArgumentBuffer: return VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+        case ResourceState::eTextureRead: return VK_ACCESS_SHADER_READ_BIT;
+        case ResourceState::eStorageRead: return VK_ACCESS_SHADER_READ_BIT;
+        case ResourceState::eStorageWrite: return VK_ACCESS_SHADER_WRITE_BIT;
+        case ResourceState::eStorageRW: return VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        case ResourceState::eColorAttachmentRead: return VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+        case ResourceState::eColorAttachmentWrite: return VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        case ResourceState::eColorAttachmentRW: return VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        case ResourceState::eDepthStencilAttachmentRead: return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+        case ResourceState::eDepthStencilAttachmentWrite: return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        case ResourceState::eDepthStencilAttachmentRW: return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        case ResourceState::eCopySource: return VK_ACCESS_TRANSFER_READ_BIT;
+        case ResourceState::eCopyDestination: return VK_ACCESS_TRANSFER_WRITE_BIT;
+        case ResourceState::eAccelStructRead: return VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+        case ResourceState::eAccelStructWrite: return VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        case ResourceState::eResolveSource: return VK_ACCESS_TRANSFER_READ_BIT;
+        case ResourceState::eResolveDestination: return VK_ACCESS_TRANSFER_WRITE_BIT;
+        default: return 0;
+    }
+}
+
+VkImageAspectFlags toVkAspectFlags(uint32_t nativeFormat)
+{
+    switch (nativeFormat)
+    {
+        case VK_FORMAT_D16_UNORM:
+        case VK_FORMAT_X8_D24_UNORM_PACK32:
+        case VK_FORMAT_D32_SFLOAT:
+            return VK_IMAGE_ASPECT_DEPTH_BIT;
+        case VK_FORMAT_D16_UNORM_S8_UINT:
+        case VK_FORMAT_D24_UNORM_S8_UINT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+            return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        case VK_FORMAT_S8_UINT: return VK_IMAGE_ASPECT_STENCIL_BIT;
+        default: return VK_IMAGE_ASPECT_COLOR_BIT;
+    }
+}
+
+DispatchData::~DispatchData()
+{
+    assert(pddt != nullptr && device != NULL);
+    if (pddt != nullptr && device != NULL)
+    {
+        for (auto&[bindingDesc, poolDescCombo] : signatureToDesc)
+        {
+            if (bindingDesc != nullptr)
+            {
+                poolDescCombo.descSetData.descSet.clear();
+                poolDescCombo.descSetData = {};
+                pddt->DestroyDescriptorPool(device, poolDescCombo.pool, nullptr);
+            }
+        }
+    }
+    signatureToDesc.clear();
+
+    assert(compute != nullptr);
+    for (auto&[pso, bindingDesc] : psoToSignature)
+    {
+        if (bindingDesc != nullptr)
+        {
+            if (compute != nullptr)
+            {
+                for (auto& descriptor : bindingDesc->descriptors)
+                {
+                    if (descriptor.second.type == DescriptorType::eConstantBuffer)
+                    {
+                        for (auto& handle : descriptor.second.handles)
+                        {
+                            if (handle != nullptr)
+                            {
+                                compute->destroyResource(reinterpret_cast<Resource>(handle), 0);
+                            }
+                        }
+                    }
+                }
+            }
+
+            delete bindingDesc;
+        }
+    }
+    psoToSignature.clear();
 }
 
 ComputeStatus Vulkan::getResourceState(uint32_t states, ResourceState& resourceStates)
 {
-    resourceStates = ResourceState::eUndefined;
-    
-    if(states & VK_IMAGE_LAYOUT_GENERAL) resourceStates = ResourceState::eGeneral;
-    if(states & VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) resourceStates |= ResourceState::eTextureRead;
-    if(states & VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) resourceStates |= ResourceState::eColorAttachmentWrite;
-    if(states & VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) resourceStates |= ResourceState::eDepthStencilAttachmentRead;
-    if(states & VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) resourceStates |= ResourceState::eCopySource;
-    if(states & VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) resourceStates |= ResourceState::eCopyDestination;
-    if(states & VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) resourceStates |= ResourceState::ePresent;
-    
+    switch (states)
+    {
+        case VK_IMAGE_LAYOUT_UNDEFINED:
+            resourceStates = ResourceState::eUndefined;
+            break;
+        default:
+        case VK_IMAGE_LAYOUT_GENERAL:
+            resourceStates = ResourceState::eGeneral;
+            break;
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+            resourceStates = ResourceState::eColorAttachmentRW;
+            break;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+        case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL:
+        case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL:
+        case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL:
+        case VK_IMAGE_LAYOUT_STENCIL_ATTACHMENT_OPTIMAL:
+            resourceStates = ResourceState::eDepthStencilAttachmentRW;
+            break;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+        case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL:
+        case VK_IMAGE_LAYOUT_STENCIL_READ_ONLY_OPTIMAL:
+            resourceStates = ResourceState::eDepthStencilAttachmentRead;
+            break;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            resourceStates = ResourceState::eTextureRead;
+            break;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+            resourceStates = ResourceState::eCopySource;
+            break;
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            resourceStates = ResourceState::eCopyDestination;
+            break;
+        case VK_IMAGE_LAYOUT_PREINITIALIZED:
+            resourceStates = ResourceState::eGenericRead;
+            break;
+        case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+        case VK_IMAGE_LAYOUT_SHARED_PRESENT_KHR:
+            resourceStates = ResourceState::ePresent;
+            break;
+    }
+
     return ComputeStatus::eOk;
 }
 
 ComputeStatus Vulkan::getNativeResourceState(ResourceState states, uint32_t& resourceStates)
 {
-    resourceStates = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    if (states & ResourceState::eGeneral) resourceStates = VK_IMAGE_LAYOUT_GENERAL;
-    if (states & ResourceState::eTextureRead) resourceStates |= VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    if (states & ResourceState::eColorAttachmentRead) resourceStates |= VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    if (states & ResourceState::eColorAttachmentWrite) resourceStates |= VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    if (states & ResourceState::eDepthStencilAttachmentRead) resourceStates |= VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    if (states & ResourceState::eCopySource) resourceStates |= VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    if (states & ResourceState::eCopyDestination) resourceStates |= VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    if (states & ResourceState::ePresent) resourceStates |= VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    resourceStates = toVkImageLayout(states);
 
     return ComputeStatus::eOk;
 }
@@ -806,43 +952,11 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
     m_device = (VkDevice)deviceArray[1];
     m_physicalDevice = (VkPhysicalDevice)deviceArray[2];
 
-    // Path where our modules are located
-    wchar_t* pluginPath{};
-    param::getPointerParam(params, param::global::kPluginPath, &pluginPath);
-    if (!pluginPath)
-    {
-        SL_LOG_ERROR( "Cannot find path to plugins");
-        return ComputeStatus::eError;
-    }
-    std::wstring path(pluginPath);
-    path += L"/NvLowLatencyVk.dll";
-    // This call translates to signature check in production and regular load otherwise
-    m_hmodReflex = security::loadLibrary(path.c_str());
-    if (!m_hmodReflex)
-    {
-        SL_LOG_ERROR( "Failed to load %S", path.c_str());
-        return ComputeStatus::eError;
-    }
-
-    // Low latency API
-    auto llRes = NvLL_VK_Initialize();
-    if (llRes)
-    {
-        SL_LOG_WARN("Low latency API for VK failed to initialize %d", llRes);
-    }
-    else
-    {
-        HANDLE semaphore;
-        llRes = NvLL_VK_InitLowLatencyDevice(m_device, &semaphore);
-        if (llRes)
-        {
-            SL_LOG_WARN("Low latency API for VK failed to initialize device %d", llRes);
-        }
-        else
-        {
-            m_lowLatencySemaphore = (VkSemaphore)semaphore;
-        }
-    }
+    #ifdef SL_WITH_NVLLVK
+    m_reflex = CreateNvLowLatencyVk(m_device, params);
+    #else
+    #error "Not implemented"
+    #endif
     
     // For callbacks we just need VkDevice
     Generic::init(m_device, params);
@@ -858,14 +972,23 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
     m_vk->getDeviceProcAddr = vk->getDeviceProcAddr;
     m_vk->computeQueueFamily = vk->computeQueueFamily;
     m_vk->computeQueueIndex = vk->computeQueueIndex;
+    m_vk->computeQueueCreateFlags = vk->computeQueueCreateFlags;
     m_vk->graphicsQueueFamily = vk->graphicsQueueFamily;
     m_vk->graphicsQueueIndex = vk->graphicsQueueIndex;
+    m_vk->graphicsQueueCreateFlags = vk->graphicsQueueCreateFlags;
     m_vk->opticalFlowQueueFamily = vk->opticalFlowQueueFamily;
     m_vk->opticalFlowQueueIndex = vk->opticalFlowQueueIndex;
+    m_vk->opticalFlowQueueCreateFlags = vk->opticalFlowQueueCreateFlags;
+    m_vk->hostGraphicsComputeQueueInfo = vk->hostGraphicsComputeQueueInfo;
     m_vk->mapVulkanInstanceAPI(m_instance);
     m_vk->mapVulkanDeviceAPI(m_device);
     m_ddt = m_vk->dispatchDeviceMap[m_device];
     m_idt = m_vk->dispatchInstanceMap[m_instance];
+
+    if (m_reflex)
+    {
+        m_reflex->initDispatchTable(m_ddt);
+    }
 
     if(m_idt.CreateDebugUtilsMessengerEXT)
     {
@@ -899,6 +1022,7 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
     VkResult result;
     {
         result = m_ddt.CreateSampler(m_device, &samplerCreateInfo, 0, &m_sampler[eSamplerLinearClamp]);
+        setDebugNameVk(m_sampler[eSamplerLinearClamp], "eSamplerLinearClamp");
         assert(result == VK_SUCCESS);
     }
     {
@@ -906,12 +1030,14 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
         samplerCreateInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
         samplerCreateInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
         result = m_ddt.CreateSampler(m_device, &samplerCreateInfo, 0, &m_sampler[eSamplerLinearMirror]);
+        setDebugNameVk(m_sampler[eSamplerLinearClamp], "eSamplerLinearMirror");
         assert(result == VK_SUCCESS);
     }
     {
         samplerCreateInfo.magFilter = VK_FILTER_NEAREST;
         samplerCreateInfo.minFilter = VK_FILTER_NEAREST;
         result = m_ddt.CreateSampler(m_device, &samplerCreateInfo, 0, &m_sampler[eSamplerPointMirror]);
+        setDebugNameVk(m_sampler[eSamplerLinearClamp], "eSamplerPointMirror");
         assert(result == VK_SUCCESS);
     }
     {
@@ -919,6 +1045,7 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
         samplerCreateInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         samplerCreateInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         result = m_ddt.CreateSampler(m_device, &samplerCreateInfo, 0, &m_sampler[eSamplerPointClamp]);
+        setDebugNameVk(m_sampler[eSamplerLinearClamp], "eSamplerPointClamp");
         assert(result == VK_SUCCESS);
     }
     m_idt.GetPhysicalDeviceMemoryProperties(m_physicalDevice, &m_vkPhysicalDeviceMemoryProperties);
@@ -939,6 +1066,7 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
     if (result != VK_SUCCESS) {
         return ComputeStatus::eError;
     }
+    setDebugNameVk(m_imageViewClear.descriptorSetLayout, "SL_imageViewClear_descriptorSetLayout");
 
     VkPushConstantRange range;
     range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -955,6 +1083,7 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
     if (result != VK_SUCCESS) {
         return ComputeStatus::eError;
     }
+    setDebugNameVk(m_imageViewClear.pipelineLayout, "SL_imageViewClear_pipelineLayout");
 
     // Create the compute pipeline for image view clears
     VkShaderModule csm;
@@ -978,6 +1107,7 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
     if (result != VK_SUCCESS) {
         return ComputeStatus::eError;
     }
+    setDebugNameVk(m_imageViewClear.doClear, "SL_imageViewClear_pipeline");
 
     m_ddt.DestroyShaderModule(m_device, csm, nullptr);
 
@@ -991,19 +1121,40 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
 
 ComputeStatus Vulkan::shutdown()
 {
-    NvLL_VK_DestroyLowLatencyDevice(m_device);
-    NvLL_VK_Unload();
+    m_dispatchContext.clear();
 
-    if (m_hmodReflex)
+    assert(m_device != NULL);
+
+    for (auto Cubin = m_kernels.begin(); Cubin != m_kernels.end(); Cubin++)
     {
-        FreeLibrary(m_hmodReflex);
-        m_hmodReflex = {};
+        KernelDataVK *cubinVk = (KernelDataVK *)(*Cubin).second;
+        cubinVk->destroy(m_ddt, m_device);
+        delete (*Cubin).second;
+    }
+    m_kernels.clear();
+
+    {
+        std::scoped_lock lock(m_mutexProfiler);
+        for (uint32_t node = 0; node < MAX_NUM_NODES; ++node)
+        {
+            for (const auto&[key, value] : m_SectionPerfMap[node])
+            {
+                for (uint32_t i = 0; i < SL_READBACK_QUEUE_SIZE; ++i)
+                {
+                    if (value.QueryPool[i] == VK_NULL_HANDLE)
+                        continue;
+                    m_ddt.DestroyQueryPool(m_device, value.QueryPool[i], nullptr);
+                }
+            }
+            m_SectionPerfMap[node].clear();
+        }
     }
 
-    if (m_idt.DestroyDebugUtilsMessengerEXT && m_debugUtilsMessenger)
-    {
-        m_idt.DestroyDebugUtilsMessengerEXT(m_instance, m_debugUtilsMessenger, nullptr);
-    }
+    // Clean up image view clear
+    m_ddt.DestroyPipeline(m_device, m_imageViewClear.doClear, nullptr);
+    m_ddt.DestroyPipelineLayout(m_device, m_imageViewClear.pipelineLayout, nullptr);
+    m_ddt.DestroyDescriptorSetLayout(m_device, m_imageViewClear.descriptorSetLayout, nullptr);
+    m_imageViewClear = {};
 
     // cleanup samplers
     for (uint32_t u = 0; u < countof(m_sampler); ++u)
@@ -1015,36 +1166,93 @@ ComputeStatus Vulkan::shutdown()
         }
     }
 
-    // Clean up image view clear
-    m_ddt.DestroyDescriptorSetLayout(m_device, m_imageViewClear.descriptorSetLayout, nullptr);
-    m_ddt.DestroyPipelineLayout(m_device, m_imageViewClear.pipelineLayout, nullptr);
-    m_ddt.DestroyPipeline(m_device, m_imageViewClear.doClear, nullptr);
-
-    Generic::shutdown();
-
-    for (auto Cubin = m_kernels.begin(); Cubin != m_kernels.end(); Cubin++)
+    if (m_idt.DestroyDebugUtilsMessengerEXT && m_debugUtilsMessenger)
     {
-        KernelDataVK *cubinVk = (KernelDataVK *)(*Cubin).second;
-        if (cubinVk->pipeline)
-        {
-            m_ddt.DestroyPipeline(m_device, cubinVk->pipeline, nullptr);
-            m_ddt.DestroyPipelineLayout(m_device, cubinVk->pipelineLayout, nullptr);
-            m_ddt.DestroyDescriptorSetLayout(m_device, cubinVk->descriptorSetLayout, nullptr);
-            m_ddt.DestroyShaderModule(m_device, cubinVk->shaderModule, nullptr);
-        }
-        else
-        {
-            //m_ddt.DestroyCuFunctionNVX(m_device, cubinVk->Function, nullptr);
-            //m_ddt.DestroyCuModuleNVX(m_device, cubinVk->Shader, nullptr);
-        }
-        delete (*Cubin).second;
+        m_idt.DestroyDebugUtilsMessengerEXT(m_instance, m_debugUtilsMessenger, nullptr);
+        m_debugUtilsMessenger = VK_NULL_HANDLE;
     }
-    m_kernels.clear();
 
     delete m_vk;
     m_vk = {};
 
-    return Generic::shutdown();
+    ComputeStatus status = Generic::shutdown();
+
+    if (m_reflex)
+    {
+        m_reflex->shutdown();
+        delete m_reflex;
+        m_reflex = {};
+    }
+
+    return status;
+}
+
+// This function retrieves queue info for presentable queues only but can be extended for any type of queue.
+ComputeStatus Vulkan::getHostQueueInfo(chi::CommandQueue queue, void* pQueueInfo)
+{
+    if (queue == NULL)
+    {
+        SL_LOG_ERROR("Invalid VK queue!");
+        return ComputeStatus::eInvalidArgument;
+    }
+
+    if (pQueueInfo == nullptr)
+    {
+        SL_LOG_ERROR("Invalid VK queue info object!");
+        return ComputeStatus::eInvalidArgument;
+    }
+
+    if (m_vk == nullptr)
+    {
+        SL_LOG_ERROR("Invalid VK table!");
+        return ComputeStatus::eInvalidPointer;
+    }
+
+    if (m_vk->hostGraphicsComputeQueueInfo.empty())
+    {
+        m_vk->hostGraphicsComputeQueueInfo.emplace_back(interposer::QueueVkInfo{ VK_QUEUE_GRAPHICS_BIT, m_vk->graphicsQueueFamily, {}, m_vk->graphicsQueueCreateFlags, m_vk->graphicsQueueIndex });
+        m_vk->hostGraphicsComputeQueueInfo.emplace_back(interposer::QueueVkInfo{ VK_QUEUE_COMPUTE_BIT, m_vk->computeQueueFamily, {}, m_vk->computeQueueCreateFlags, m_vk->computeQueueIndex });
+    }
+
+    VkQueue hostQueue{};
+    auto pQueueVkInfo = reinterpret_cast<interposer::QueueVkInfo*>(pQueueInfo);
+    for (const auto& qInfo : m_vk->hostGraphicsComputeQueueInfo)
+    {
+        for (uint32_t qIndex = 0; qIndex < qInfo.count; qIndex++)
+        {
+            CHI_CHECK(getDeviceQueue(qInfo.familyIndex, qIndex, qInfo.createFlags, hostQueue));
+            if (hostQueue == queue)
+            {
+                pQueueVkInfo->flags = qInfo.flags;
+                pQueueVkInfo->familyIndex = qInfo.familyIndex;
+                pQueueVkInfo->index = qIndex;
+                return ComputeStatus::eOk;
+            }
+        }
+    }
+
+    SL_LOG_ERROR("Invalid VK queue %p - not created by the application!", queue);
+    return ComputeStatus::eInvalidArgument;
+}
+
+ComputeStatus Vulkan::getDeviceQueue(uint32_t queueFamily, uint32_t queueIndex, uint32_t queueCreateFlags, VkQueue& queue)
+{
+    if (queueCreateFlags == 0)
+    {
+        m_ddt.GetDeviceQueue(m_device, queueFamily, queueIndex, &queue);
+    }
+    else
+    {
+        VkDeviceQueueInfo2 queueInfo{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2, NULL, queueCreateFlags, queueFamily, queueIndex };
+        m_ddt.GetDeviceQueue2(m_device, &queueInfo, &queue);
+    }
+
+    if (!queue)
+    {
+        return ComputeStatus::eError;
+    }
+
+    return ComputeStatus::eOk;
 }
 
 ComputeStatus Vulkan::waitForIdle(Device device)
@@ -1167,10 +1375,7 @@ ComputeStatus Vulkan::destroyKernel(Kernel& kernel)
     }
 
     KernelDataVK *cubinVk = (KernelDataVK *)(*cubin).second;
-    if (cubinVk->shaderModule)
-    {
-        m_ddt.DestroyShaderModule(m_device, cubinVk->shaderModule, nullptr);
-    }
+    cubinVk->destroy(m_ddt, m_device);
     
     delete (*cubin).second;
     m_kernels.erase(cubin);
@@ -1200,40 +1405,35 @@ ComputeStatus Vulkan::destroyCommandListContext(ICommandListContext* ctx)
 ComputeStatus Vulkan::createCommandQueue(CommandQueueType type, CommandQueue& queue, const char friendlyName[], uint32_t index)
 {
     queue = {};
-    if (type == CommandQueueType::eCompute)
+    uint32_t queueFamily{}, queueIndex{}, queueCreateFlags{};
+    switch (type)
     {
-        VkQueue tmp = {};
-        m_ddt.GetDeviceQueue(m_device, m_vk->computeQueueFamily, m_vk->computeQueueIndex + index, &tmp);
-        if (!tmp)
-        {
-            return ComputeStatus::eError;
-        }
-        queue = new chi::CommandQueueVk{ tmp, type, m_vk->computeQueueFamily, m_vk->computeQueueIndex + index };
-    }
-    else if (type == CommandQueueType::eGraphics)
-    {
-        VkQueue tmp = {};
-        m_ddt.GetDeviceQueue(m_device, m_vk->graphicsQueueFamily, m_vk->graphicsQueueIndex + index, &tmp);
-        if (!tmp)
-        {
-            return ComputeStatus::eError;
-        }
-        queue = new chi::CommandQueueVk{ tmp, type, m_vk->graphicsQueueFamily, m_vk->graphicsQueueIndex + index };
-    }
-    else if (type == CommandQueueType::eOpticalFlow)
-    {
-        VkQueue tmp = {};
-        m_ddt.GetDeviceQueue(m_device, m_vk->opticalFlowQueueFamily, m_vk->opticalFlowQueueIndex + index, &tmp);
-        if (!tmp)
-        {
-            return ComputeStatus::eError;
-        }
-        queue = new chi::CommandQueueVk{ tmp, type, m_vk->opticalFlowQueueFamily, m_vk->opticalFlowQueueIndex + index };
-    }
-    else
-    {
+    case CommandQueueType::eGraphics:
+        queueFamily = m_vk->graphicsQueueFamily;
+        queueIndex = m_vk->graphicsQueueIndex;
+        queueCreateFlags = m_vk->graphicsQueueCreateFlags;
+        break;
+
+    case CommandQueueType::eCompute:
+        queueFamily = m_vk->computeQueueFamily;
+        queueIndex = m_vk->computeQueueIndex;
+        queueCreateFlags = m_vk->computeQueueCreateFlags;
+        break;
+
+    case CommandQueueType::eOpticalFlow:
+        queueFamily = m_vk->opticalFlowQueueFamily;
+        queueIndex = m_vk->opticalFlowQueueIndex;
+        queueCreateFlags = m_vk->opticalFlowQueueCreateFlags;
+        break;
+
+    default:
         return ComputeStatus::eNoImplementation;
     }
+
+    VkQueue tmp{};
+    CHI_CHECK(getDeviceQueue(queueFamily, queueIndex + index, queueCreateFlags, tmp));
+    queue = new chi::CommandQueueVk{ tmp, type, queueFamily, queueIndex + index };
+
     return ComputeStatus::eOk;
 }
 
@@ -1259,19 +1459,19 @@ ComputeStatus Vulkan::createFence(FenceFlags flags, uint64_t initialValue, Fence
 
     VkSemaphore fence;
     VK_CHECK(m_ddt.CreateSemaphore(m_device, &createInfo, NULL, &fence));
+    setDebugNameVk(fence, friendlyName);
 
-    outFence = new SemaphoreVk(fence);
+    outFence = fence;
 
     return ComputeStatus::eOk;
 }
 
-ComputeStatus Vulkan::destroyFence(Fence fence)
+ComputeStatus Vulkan::destroyFence(Fence& fence)
 {
-    auto semaphore = (SemaphoreVk*)fence;
-    if (semaphore)
+    if (fence)
     {
-        m_ddt.DestroySemaphore(m_device, (VkSemaphore)semaphore->native, NULL);
-        delete semaphore;
+        m_ddt.DestroySemaphore(m_device, (VkSemaphore)fence, NULL);
+        fence = VK_NULL_HANDLE;
     }
 
     return ComputeStatus::eOk;
@@ -1297,6 +1497,13 @@ ComputeStatus Vulkan::bindKernel(const Kernel InKernel)
         thread.kernel = (KernelDataVK*)(*it).second;
     }
     
+    if (thread.psoToSignature.empty())
+    {
+        thread.pddt = &m_ddt;
+        thread.device = m_device;
+        thread.compute = this;
+    }
+
     auto it = thread.psoToSignature.find(thread.kernel->hash);
     if (it == thread.psoToSignature.end())
     {
@@ -1332,7 +1539,12 @@ ComputeStatus Vulkan::bindConsts(uint32_t base, uint32_t reg, void *data, size_t
         slot.instance = (slot.instance + 1) % instances;
         uint32_t offset = slot.instance * alignedDataSize;
         memcpy((uint8_t*)slot.mapped + offset, data, dataSize);
-        thread.signature->offsets[slot.offsetIndex] = offset;
+        if (thread.signature->offsets[slot.offsetIndex] != offset)
+        {
+            thread.signature->offsets[slot.offsetIndex] = offset;
+            // ensure descriptor update occurs for all of the new offsets the first time.
+            slot.dirty = true;
+        }
     }
     else
     {
@@ -1343,7 +1555,7 @@ ComputeStatus Vulkan::bindConsts(uint32_t base, uint32_t reg, void *data, size_t
         ResourceDescription cbDesc = ResourceDescription{alignedDataSize * instances,1,chi::NativeFormatUnknown,chi::eHeapTypeUpload, chi::ResourceState::eConstantBuffer};
         Resource cb;
         CHI_CHECK(createBuffer(cbDesc, cb, "const buffer"));
-        slot.handles.push_back(((sl::Resource*)cb)->native);
+        slot.handles.push_back(cb);
         slot.mapped = {};
         auto info = (sl::Resource*)cb;
         VK_CHECK(m_ddt.MapMemory(m_device, (VkDeviceMemory)info->memory, 0, cbDesc.width, 0, &slot.mapped));
@@ -1461,10 +1673,12 @@ ComputeStatus Vulkan::bindRawBuffer(uint32_t base, uint32_t reg, Resource InReso
 
 ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
 {
+    bool needsUpdate = false;
     if (thread.signatureToDesc.find(thread.signature) == thread.signatureToDesc.end())
     {
         std::vector<VkDescriptorSetLayoutBinding> bindings = { };
         std::vector<VkDescriptorPoolSize> poolSizes = { };
+        uint32_t totalDescriptorCount{};
         for (auto it : thread.signature->descriptors)
         {
             auto& slot = it.second;
@@ -1474,6 +1688,7 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
             binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
             VkDescriptorPoolSize ps = {};
             ps.descriptorCount = (uint32_t)slot.handles.size();
+            totalDescriptorCount += ps.descriptorCount;
             if (slot.type == DescriptorType::eStorageBuffer)
             {
                 ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1513,6 +1728,7 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
             dslInfo.pBindings = bindings.data();
             //dslInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
             VK_CHECK(m_ddt.CreateDescriptorSetLayout(m_device, &dslInfo, 0, &thread.kernel->descriptorSetLayout));
+            setDebugNameVk(thread.kernel->descriptorSetLayout, "SL_thread_kernel_descriptorSetLayout");
 
             VkPipelineLayoutCreateInfo plInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
             plInfo.setLayoutCount = 1;
@@ -1520,25 +1736,36 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
             plInfo.pushConstantRangeCount = 0;
             plInfo.pPushConstantRanges = {};
             VK_CHECK(m_ddt.CreatePipelineLayout(m_device, &plInfo, 0, &thread.kernel->pipelineLayout));
+            setDebugNameVk(thread.kernel->pipelineLayout, "SL_thread_kernel_pipelineLayout");
         }
 
+        auto id = GetCurrentThreadId();
         VkDescriptorPoolCreateInfo descriptorPoolInfo =
         {
             VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             nullptr,
             (VkDescriptorPoolCreateFlags)0,
-            (uint32_t)thread.kernel->numDescriptors,
+            ((uint32_t)thread.kernel->numDescriptorSets * totalDescriptorCount),
             (uint32_t)(poolSizes.size()),
             poolSizes.data()
         };
         PoolDescCombo& combo = thread.signatureToDesc[thread.signature];
         VK_CHECK(m_ddt.CreateDescriptorPool(m_device, &descriptorPoolInfo, nullptr, &combo.pool));
-        combo.desc.resize(thread.kernel->numDescriptors);
-        for (uint32_t i = 0; i < thread.kernel->numDescriptors; i++)
+        std::stringstream name{};
+        name << "SL_thread_" << id << "_descriptor_pool";
+        setDebugNameVk(combo.pool, name.str().c_str());
+
+        combo.descSetData.descSet.resize(thread.kernel->numDescriptorSets);
+        for (uint32_t i = 0; i < thread.kernel->numDescriptorSets; i++)
         {
             VkDescriptorSetAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO , nullptr, combo.pool, 1, &thread.kernel->descriptorSetLayout };
-            VK_CHECK(m_ddt.AllocateDescriptorSets(m_device, &allocInfo, &combo.desc[i]));
+            VK_CHECK(m_ddt.AllocateDescriptorSets(m_device, &allocInfo, &combo.descSetData.descSet[i]));
+            name = std::stringstream{};
+            name << "SL_thread_" << id << "_kernel_descriptor_set_" << i;
+            setDebugNameVk(combo.descSetData.descSet[i], name.str().c_str());
         }
+
+        needsUpdate = true;
     }
 
     auto writeBufferDescriptorSet = [](VkDescriptorSet dstSet, VkDescriptorType type, uint32_t binding, VkDescriptorBufferInfo* bufferInfo, uint32_t descriptorCount = 1)->VkWriteDescriptorSet
@@ -1570,7 +1797,6 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
         std::vector<VkWriteDescriptorSet> writeDescriptorSets = {};
         std::vector<VkDescriptorBufferInfo> buffers[16];
         std::vector<VkDescriptorImageInfo> images[16];
-        bool needsUpdate = false;
         for (auto& it : thread.signature->descriptors)
         {
             auto& slot = it.second;
@@ -1579,8 +1805,9 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
         }
         if (needsUpdate)
         {
-            thread.kernel->descriptorIndex = (thread.kernel->descriptorIndex + 1) % thread.kernel->numDescriptors;
-            auto index = thread.kernel->descriptorIndex;
+            combo.descSetData.descSetIndex = (combo.descSetData.descSetIndex + 1) % thread.kernel->numDescriptorSets;
+            auto& descSet = combo.descSetData.descSet[combo.descSetData.descSetIndex];
+
             for (auto& it : thread.signature->descriptors)
             {
                 auto& slot = it.second;
@@ -1601,7 +1828,7 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
                         }
                         buffers[slot.registerIndex].push_back(info);
                     }
-                    writeDescriptorSets.push_back(writeBufferDescriptorSet(combo.desc[index], VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, slot.registerIndex, buffers[slot.registerIndex].data(), (uint32_t)slot.handles.size()));
+                    writeDescriptorSets.push_back(writeBufferDescriptorSet(descSet, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, slot.registerIndex, buffers[slot.registerIndex].data(), (uint32_t)slot.handles.size()));
                 }
                 else if (slot.type == DescriptorType::eStorageTexture)
                 {
@@ -1610,7 +1837,7 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
                         VkDescriptorImageInfo info = { nullptr, (VkImageView)h, VK_IMAGE_LAYOUT_GENERAL };
                         images[slot.registerIndex].push_back(info);
                     }
-                    writeDescriptorSets.push_back(writeImageDescriptorSet(combo.desc[index], VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, slot.registerIndex, images[slot.registerIndex].data(), (uint32_t)slot.handles.size()));
+                    writeDescriptorSets.push_back(writeImageDescriptorSet(descSet, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, slot.registerIndex, images[slot.registerIndex].data(), (uint32_t)slot.handles.size()));
                 }
                 else if (slot.type == DescriptorType::eTexture)
                 {
@@ -1619,7 +1846,7 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
                         VkDescriptorImageInfo info = { nullptr, (VkImageView)h, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
                         images[slot.registerIndex].push_back(info);
                     }
-                    writeDescriptorSets.push_back(writeImageDescriptorSet(combo.desc[index], VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, slot.registerIndex, images[slot.registerIndex].data(), (uint32_t)slot.handles.size()));
+                    writeDescriptorSets.push_back(writeImageDescriptorSet(descSet, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, slot.registerIndex, images[slot.registerIndex].data(), (uint32_t)slot.handles.size()));
                 }
                 else if (slot.type == DescriptorType::eSampler)
                 {
@@ -1628,11 +1855,11 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
                         VkDescriptorImageInfo info = { (VkSampler)h,nullptr,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
                         images[slot.registerIndex].push_back(info);
                     }
-                    writeDescriptorSets.push_back(writeImageDescriptorSet(combo.desc[index], VK_DESCRIPTOR_TYPE_SAMPLER, slot.registerIndex, images[slot.registerIndex].data(), (uint32_t)slot.handles.size()));
+                    writeDescriptorSets.push_back(writeImageDescriptorSet(descSet, VK_DESCRIPTOR_TYPE_SAMPLER, slot.registerIndex, images[slot.registerIndex].data(), (uint32_t)slot.handles.size()));
                 }
                 else if (slot.type == DescriptorType::eConstantBuffer)
                 {
-                    auto buffer = (VkBuffer)slot.handles.front();
+                    auto buffer = reinterpret_cast<VkBuffer>(reinterpret_cast<Resource>(slot.handles.front())->native);
                     VkDescriptorBufferInfo info = {};
                     if (buffer)
                     {
@@ -1644,7 +1871,7 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
                         };
                     }
                     buffers[slot.registerIndex].push_back(info);
-                    writeDescriptorSets.push_back(writeBufferDescriptorSet(combo.desc[index], VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, slot.registerIndex, buffers[slot.registerIndex].data(), (uint32_t)slot.handles.size()));
+                    writeDescriptorSets.push_back(writeBufferDescriptorSet(descSet, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, slot.registerIndex, buffers[slot.registerIndex].data(), (uint32_t)slot.handles.size()));
                 }
                 slot.dirty = false;
             }
@@ -1662,6 +1889,7 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
         pipelineInfo.stage.module = thread.kernel->shaderModule;
         pipelineInfo.stage.pName = "main";
         VK_CHECK(m_ddt.CreateComputePipelines(m_device, nullptr, 1, &pipelineInfo, 0, &thread.kernel->pipeline));
+        setDebugNameVk(thread.kernel->pipeline, "SL_thread_kernel_pipeline");
     }
     return ComputeStatus::eOk;
 }
@@ -1673,19 +1901,24 @@ ComputeStatus Vulkan::dispatch(unsigned int blockX, unsigned int blockY, unsigne
 
     if (thread.kernel->shaderModule)
     {
-        processDescriptors(thread);
+        ComputeStatus ret = processDescriptors(thread);
+        if (ret != ComputeStatus::eOk)
+        {
+            SL_LOG_ERROR("VK descriptor-processing failed!");
+            return ret;
+        }
 
         auto& combo = thread.signatureToDesc[thread.signature];
 
         m_ddt.CmdBindPipeline(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, thread.kernel->pipeline);
-        m_ddt.CmdBindDescriptorSets(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, thread.kernel->pipelineLayout, 0, 1, &combo.desc[thread.kernel->descriptorIndex], (uint32_t)thread.signature->offsets.size(), thread.signature->offsets.data());
+        m_ddt.CmdBindDescriptorSets(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, thread.kernel->pipelineLayout, 0, 1, &(combo.descSetData.descSet[combo.descSetData.descSetIndex]), (uint32_t)thread.signature->offsets.size(), thread.signature->offsets.data());
         m_ddt.CmdDispatch(m_cmdBuffer, blockX, blockY, blockZ);
     }
 
     return ComputeStatus::eOk;
 }
 
-ComputeStatus Vulkan::createTexture2DResourceSharedImpl(ResourceDescription &resDesc, Resource &outResource, bool UseNativeFormat, ResourceState initialState)
+ComputeStatus Vulkan::createTexture2DResourceSharedImpl(ResourceDescription &resDesc, Resource &outResource, bool UseNativeFormat, ResourceState initialState, const char InFriendlyName[])
 {
     VkImageView imageView{};
     VkImage image{};
@@ -1721,7 +1954,7 @@ ComputeStatus Vulkan::createTexture2DResourceSharedImpl(ResourceDescription &res
     else
     {
         resDesc.flags &= ~ResourceFlags::eDepthStencilAttachment;
-        resDesc.state &= ~(ResourceState::eDepthStencilAttachmentRead | ResourceState::eDepthStencilAttachmentWrite);
+        resDesc.state &= ~ResourceState::eDepthStencilAttachmentRW;
     }
     if (isFormatSupported(resDesc.format, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
     {
@@ -1830,6 +2063,9 @@ ComputeStatus Vulkan::createTexture2DResourceSharedImpl(ResourceDescription &res
             m_ddt.DestroyImage(m_device, image, nullptr);
             return ComputeStatus::eError;
         }
+        std::stringstream name{};
+        name << InFriendlyName << "_device_memory";
+        setDebugNameVk(deviceMemory, name.str().c_str());
 
         result = m_ddt.BindImageMemory(m_device, image, deviceMemory, 0);
         if (result != VK_SUCCESS) {
@@ -1846,7 +2082,7 @@ ComputeStatus Vulkan::createTexture2DResourceSharedImpl(ResourceDescription &res
         texViewCreateInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
         texViewCreateInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
         texViewCreateInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-        texViewCreateInfo.subresourceRange.aspectMask = resDesc.flags & ResourceFlags::eDepthStencilAttachment ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+        texViewCreateInfo.subresourceRange.aspectMask = toVkAspectFlags(resDesc.nativeFormat);
         texViewCreateInfo.subresourceRange.baseMipLevel = 0;
         texViewCreateInfo.subresourceRange.levelCount = 1;
         texViewCreateInfo.subresourceRange.baseArrayLayer = 0;
@@ -1858,6 +2094,9 @@ ComputeStatus Vulkan::createTexture2DResourceSharedImpl(ResourceDescription &res
             m_ddt.DestroyImage(m_device, image, nullptr);
             return ComputeStatus::eError;
         }
+        name = std::stringstream{};
+        name << InFriendlyName << "_image_view";
+        setDebugNameVk(imageView, name.str().c_str());
     }
     
     // This pointer is deleted when DestroyResource is called on the object.
@@ -1874,7 +2113,7 @@ ComputeStatus Vulkan::createTexture2DResourceSharedImpl(ResourceDescription &res
     return ComputeStatus::eOk;
 }
 
-ComputeStatus Vulkan::createBufferResourceImpl(ResourceDescription &resDesc, Resource &outResource, ResourceState initialState)
+ComputeStatus Vulkan::createBufferResourceImpl(ResourceDescription &resDesc, Resource &outResource, ResourceState initialState, const char InFriendlyName[])
 {
     VkBuffer buffer{};
     VkDeviceMemory deviceMemory{};
@@ -1894,7 +2133,7 @@ ComputeStatus Vulkan::createBufferResourceImpl(ResourceDescription &resDesc, Res
                          // can be used as a target of a CopyHostToDeviceBuffer() call which in turn calls into vkCmdCopyBuffer().
                          // The vulkan spec specifies that such a buffer needs to have the VK_BUFFER_USAGE_TRANSFER_DST_BIT flag set on creation.
                          // https://www.khronos.org/registry/vulkan/specs/1.1-extensions/html/vkspec.html#VUID-vkCmdCopyBuffer-dstBuffer-00120
-                         | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                         | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                          // Internal buffers created with eHeapTypeDefault heap type
                          // can be added to a shader input/output via SetInputBuffer()/SetOutputBuffer() call which in turn calls
                          // into vkGetBufferDeviceAddress/vkGetBufferDeviceAddressKHR/vkGetBufferDeviceAddressEXT().
@@ -1995,6 +2234,9 @@ ComputeStatus Vulkan::createBufferResourceImpl(ResourceDescription &resDesc, Res
         m_ddt.DestroyBuffer(m_device, buffer, nullptr);
         return ComputeStatus::eError;
     }
+    std::stringstream name{};
+    name << InFriendlyName << "_device_memory";
+    setDebugNameVk(deviceMemory, name.str().c_str());
 
     result = m_ddt.BindBufferMemory(m_device, buffer, deviceMemory, 0);
     if (result != VK_SUCCESS) {
@@ -2102,7 +2344,7 @@ ComputeStatus Vulkan::copyHostToDeviceTexture(CommandList InCmdList, uint64_t In
             VK_QUEUE_FAMILY_IGNORED,
             VK_QUEUE_FAMILY_IGNORED,
             dst,
-            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}
+            {toVkAspectFlags(dstResource->nativeFormat), 0, 1, 0, 1}
         };
         m_ddt.CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &transferBarrier);
     }
@@ -2112,7 +2354,7 @@ ComputeStatus Vulkan::copyHostToDeviceTexture(CommandList InCmdList, uint64_t In
 
     // Copy from staging to texture
     VkBufferImageCopy buffImageCopyRegions{};
-    buffImageCopyRegions.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    buffImageCopyRegions.imageSubresource.aspectMask = toVkAspectFlags(dstResource->nativeFormat);
     buffImageCopyRegions.imageSubresource.layerCount = 1;
     buffImageCopyRegions.imageExtent = { desc.width, desc.height, 1 };
     m_ddt.CmdCopyBufferToImage(commandBuffer, scratch, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &buffImageCopyRegions);
@@ -2128,7 +2370,7 @@ ComputeStatus Vulkan::copyHostToDeviceTexture(CommandList InCmdList, uint64_t In
             VK_QUEUE_FAMILY_IGNORED,
             VK_QUEUE_FAMILY_IGNORED,
             dst,
-            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}
+            {toVkAspectFlags(dstResource->nativeFormat), 0, 1, 0, 1}
         };
         m_ddt.CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &useBarrier);
     }
@@ -2173,7 +2415,7 @@ ComputeStatus Vulkan::insertGPUBarrier(CommandList InCmdList, Resource InResourc
                 VK_QUEUE_FAMILY_IGNORED,
                 VK_QUEUE_FAMILY_IGNORED,
                 (VkImage)inResourceVK->native,
-                { VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}
+                { toVkAspectFlags(inResourceVK->nativeFormat), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}
             };
 
             m_ddt.CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, 0, 0, 0, 1, &memoryBarrier);
@@ -2220,18 +2462,17 @@ ComputeStatus Vulkan::transitionResourceImpl(CommandList cmdList, const Resource
         }
         else
         {
-            bool depth = (transitions[i].from & ResourceState::eDepthStencilAttachmentRead) != 0 || (transitions[i].to & ResourceState::eDepthStencilAttachmentRead) != 0;
             VkImageMemoryBarrier barrier{};
             barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             barrier.pNext = nullptr;
             barrier.oldLayout = toVkImageLayout(transitions[i].from);
-            barrier.newLayout = toVkImageLayout(transitions[i].to);
+            barrier.newLayout = toVkImageLayout(transitions[i].to == ResourceState::eUndefined ? ResourceState::eGeneral : transitions[i].to);
             barrier.srcAccessMask = toVkAccessFlags(transitions[i].from);
             barrier.dstAccessMask = toVkAccessFlags(transitions[i].to);
             barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.image = (VkImage)info->native;
-            barrier.subresourceRange.aspectMask = depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.aspectMask = toVkAspectFlags(info->nativeFormat);
             barrier.subresourceRange.baseArrayLayer = 0;
             barrier.subresourceRange.baseMipLevel = 0;
             barrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
@@ -2298,7 +2539,7 @@ ComputeStatus Vulkan::getResourceDescription(Resource resource, ResourceDescript
         else
         {
             resDesc.flags &= ~ResourceFlags::eDepthStencilAttachment;
-            resDesc.state &= ~(ResourceState::eDepthStencilAttachmentRead | ResourceState::eDepthStencilAttachmentWrite);
+            resDesc.state &= ~ResourceState::eDepthStencilAttachmentRW;
         }
         if (isFormatSupported(resDesc.format, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
         {
@@ -2524,18 +2765,12 @@ ComputeStatus Vulkan::copyResource(CommandList InCmdList, Resource InDstResource
     {
         VkImageCopy copyRegion = 
         { 
-            { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            { toVkAspectFlags(src->nativeFormat), 0, 0, 1 },
             {0,0,0},
-            { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            { toVkAspectFlags(dst->nativeFormat), 0, 0, 1 },
             {0, 0, 0},
             {desc.width, desc.height, 1}
         };
-        bool depth = desc.flags & ResourceFlags::eDepthStencilAttachment;
-        if (depth)
-        {
-            copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-            copyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-        }
         m_ddt.CmdCopyImage((VkCommandBuffer)InCmdList, (VkImage)src->native, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, (VkImage)dst->native, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
     }
 
@@ -2598,7 +2833,7 @@ ComputeStatus Vulkan::clearView(CommandList InCmdList, Resource InResource, cons
         clearColor.float32[2] = Color.z;
         clearColor.float32[3] = Color.w;
         VkImageSubresourceRange subresourceRange;
-        subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        subresourceRange.aspectMask = toVkAspectFlags(vkResource->nativeFormat);
         subresourceRange.baseMipLevel = 0;
         subresourceRange.levelCount = 1;
         subresourceRange.baseArrayLayer = 0;
@@ -2668,13 +2903,15 @@ int Vulkan::destroyResourceDeferredImpl(const Resource resource)
     // Note: From SL 2.0 there is no special VK Resource structure, it is all unified with d3d
     
     // Try to find a buffer to free first
+    bool destroyBuffer = false;
+    bool destroyImage = false;
     if (resource->type == ResourceType::eFence)
     {
         m_ddt.DestroySemaphore(m_device, (VkSemaphore)resource->native, nullptr);
     }
     else if(resource->type == ResourceType::eBuffer)
     {
-        m_ddt.DestroyBuffer(m_device, (VkBuffer)resource->native, nullptr);
+        destroyBuffer = true;
     }
     else
     {
@@ -2682,12 +2919,22 @@ int Vulkan::destroyResourceDeferredImpl(const Resource resource)
         if (resource->memory)
         {
             // If there is no memory then we did not create this image
-            m_ddt.DestroyImage(m_device, (VkImage)resource->native, nullptr);
+            destroyImage = true;
         }
     }
+
     if (resource->memory)
     {
         m_ddt.FreeMemory(m_device, (VkDeviceMemory)resource->memory, nullptr);
+    }
+
+    if (destroyBuffer)
+    {
+        m_ddt.DestroyBuffer(m_device, (VkBuffer)resource->native, nullptr);
+    }
+    else if (destroyImage)
+    {
+        m_ddt.DestroyImage(m_device, (VkImage)resource->native, nullptr);
     }
 
     return 0;
@@ -2698,9 +2945,49 @@ std::wstring Vulkan::getDebugName(Resource res)
     return L"Unknown";
 }
 
+#ifdef SL_DEBUG
+#define SET_VK_DEBUG_NAME(type, vk_object_type) \
+    ComputeStatus Vulkan::setDebugNameVk(type vkStruct, const char* name) \
+    { \
+        if (m_ddt.SetDebugUtilsObjectNameEXT == nullptr) \
+        { \
+            return ComputeStatus::eError; \
+        } \
+        const VkDebugUtilsObjectNameInfoEXT info = \
+        { \
+            VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT, \
+            nullptr, \
+            (vk_object_type), \
+            (uint64_t)vkStruct, \
+            (name), \
+        }; \
+        m_ddt.SetDebugUtilsObjectNameEXT(m_device, &info); \
+        return ComputeStatus::eOk; \
+    }
+#else
+#define SET_VK_DEBUG_NAME(type, vk_object_type) \
+    ComputeStatus Vulkan::setDebugNameVk(type , const char* ) \
+    { \
+        return ComputeStatus::eOk; \
+    }
+#endif
+
+SET_VK_DEBUG_NAME(VkDescriptorSet, VK_OBJECT_TYPE_DESCRIPTOR_SET)
+SET_VK_DEBUG_NAME(VkDescriptorSetLayout, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT)
+SET_VK_DEBUG_NAME(VkDeviceMemory, VK_OBJECT_TYPE_DEVICE_MEMORY)
+SET_VK_DEBUG_NAME(VkPipeline, VK_OBJECT_TYPE_PIPELINE)
+SET_VK_DEBUG_NAME(VkPipelineLayout, VK_OBJECT_TYPE_PIPELINE_LAYOUT)
+SET_VK_DEBUG_NAME(VkQueryPool, VK_OBJECT_TYPE_QUERY_POOL)
+SET_VK_DEBUG_NAME(VkSampler, VK_OBJECT_TYPE_SAMPLER)
+SET_VK_DEBUG_NAME(VkSemaphore, VK_OBJECT_TYPE_SEMAPHORE)
+SET_VK_DEBUG_NAME(VkDescriptorPool, VK_OBJECT_TYPE_DESCRIPTOR_POOL)
+SET_VK_DEBUG_NAME(VkImageView, VK_OBJECT_TYPE_IMAGE_VIEW)
+
+#undef SET_VK_DEBUG_NAME
+
 ComputeStatus Vulkan::setDebugName(Resource InOutResource, const char InFriendlyName[])
 {
-#if !(defined SL_PRODUCTION || defined SL_REL_EXT_DEV)
+#ifdef SL_DEBUG
     sl::Resource* vkResource = (sl::Resource*) InOutResource;
 
     // The VK_EXT_debug_utils may not have been enabled so don't try to set names by default
@@ -2765,6 +3052,18 @@ ComputeStatus Vulkan::setDebugName(Resource InOutResource, const char InFriendly
             VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
             nullptr,
             VK_OBJECT_TYPE_SEMAPHORE,
+            (uint64_t)vkResource->native,
+            InFriendlyName,
+        };
+        m_ddt.SetDebugUtilsObjectNameEXT(m_device, &ObjectNameInfo);
+    }
+    else if (vkResource->type == ResourceType::eHostFence)
+    {
+        VkDebugUtilsObjectNameInfoEXT ObjectNameInfo =
+        {
+            VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
+            nullptr,
+            VK_OBJECT_TYPE_FENCE,
             (uint64_t)vkResource->native,
             InFriendlyName,
         };
@@ -2848,7 +3147,6 @@ ComputeStatus Vulkan::copyBufferToReadbackBuffer(CommandList InCmdList, Resource
 
 ComputeStatus Vulkan::beginPerfSection(CommandList cmdList, const char *key, unsigned int node, bool reset)
 {
-#if SL_ENABLE_TIMING
     std::scoped_lock lock(m_mutexProfiler);
     auto Section = m_SectionPerfMap[node].find(key);
     if (Section == m_SectionPerfMap[node].end())
@@ -2881,6 +3179,9 @@ ComputeStatus Vulkan::beginPerfSection(CommandList cmdList, const char *key, uns
             SL_LOG_ERROR( "Failed to create query pool");
             return ComputeStatus::eError;
         }
+        std::stringstream name{};
+        name << "SL_query_pool_" << Data.QueryIdx;
+        setDebugNameVk(Data.QueryPool[Data.QueryIdx], name.str().c_str());
         m_ddt.CmdResetQueryPool(commandBuffer, Data.QueryPool[Data.QueryIdx], 0, 2);
     }
     else
@@ -2907,13 +3208,11 @@ ComputeStatus Vulkan::beginPerfSection(CommandList cmdList, const char *key, uns
     }
 
     m_ddt.CmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, Data.QueryPool[Data.QueryIdx], 0);
-#endif
     return ComputeStatus::eOk;
 }
 
 ComputeStatus Vulkan::endPerfSection(CommandList cmdList, const char *key, float &avgTimeMS, unsigned int node)
 {
-#if SL_ENABLE_TIMING
     std::scoped_lock lock(m_mutexProfiler);
     auto Section = m_SectionPerfMap[node].find(key);
     if (Section == m_SectionPerfMap[node].end())
@@ -2928,9 +3227,6 @@ ComputeStatus Vulkan::endPerfSection(CommandList cmdList, const char *key, float
 
     avgTimeMS = Data.NumExecutedQueries ? Data.AccumulatedTimeMS / Data.NumExecutedQueries : 0;
     //OutAvgTimeMS = Data.Times.empty() ? 0.0f : (float)Data.Times[Data.Times.size() / 2];
-#else
-    avgTimeMS = 0;
-#endif
     return ComputeStatus::eOk;
 }
 
@@ -2960,7 +3256,10 @@ ComputeStatus Vulkan::getSwapChainBuffer(SwapChain swapchain, uint32_t index, Re
 
     VkImageView imageView;
     VK_CHECK(m_ddt.CreateImageView(m_device, &texViewCreateInfo, 0, &imageView));
-    
+    std::stringstream name{};
+    name << "SL_swapchain_image_" << index << "_view";
+    setDebugNameVk(imageView, name.str().c_str());
+
     // This pointer is deleted when DestroyResource is called on the object.
     buffer = new sl::Resource{ ResourceType::eTex2d, swapchainImages[index], nullptr, imageView };
     buffer->nativeFormat = sc->info.imageFormat;
@@ -2998,12 +3297,13 @@ ComputeStatus Vulkan::getNativeFormat(Format format, NativeFormat& native)
         case eFormatRG16UN:     native = VK_FORMAT_R16G16_UNORM; break;
         case eFormatR32UI:      native = VK_FORMAT_R32_UINT; break;
         case eFormatRG32UI:     native = VK_FORMAT_R32G32_UINT; break;
-        case eFormatRG32F:     native = VK_FORMAT_R32G32_SFLOAT; break;
+        case eFormatRG32F:      native = VK_FORMAT_R32G32_SFLOAT; break;
         case eFormatSRGBA8UN:   native = VK_FORMAT_R8G8B8A8_SRGB; break;
         case eFormatSBGRA8UN:   native = VK_FORMAT_B8G8R8A8_SRGB; break;
         case eFormatD24S8:      native = VK_FORMAT_D24_UNORM_S8_UINT; break;
-        case eFormatD32S32:      native = VK_FORMAT_D32_SFLOAT; break;
-        case eFormatR32F:      native = VK_FORMAT_R32_SFLOAT; break;
+        case eFormatD32S32:     native = VK_FORMAT_D32_SFLOAT; break;
+        case eFormatR32F:       native = VK_FORMAT_R32_SFLOAT; break;
+        case eFormatD32S8U:     native = VK_FORMAT_D32_SFLOAT_S8_UINT; break;   
         case eFormatE5M3: assert(false);
     }
     
@@ -3038,6 +3338,7 @@ ComputeStatus Vulkan::getNativeFormat(Format format, NativeFormat& native)
         case VK_FORMAT_R32G32_SFLOAT:               format = eFormatRG32F; break;
         case VK_FORMAT_D24_UNORM_S8_UINT:           format = eFormatD24S8; break;
         case VK_FORMAT_D32_SFLOAT:                  format = eFormatD32S32; break;
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:          format = eFormatD32S8U; break;
         default:                                    format = eFormatINVALID;
     }
 
@@ -3046,46 +3347,20 @@ ComputeStatus Vulkan::getNativeFormat(Format format, NativeFormat& native)
 
  ComputeStatus Vulkan::setSleepMode(const ReflexOptions& consts)
  {
-     NVLL_VK_SET_SLEEP_MODE_PARAMS params{ 
-         consts.mode != ReflexMode::eOff,
-         consts.mode == ReflexMode::eLowLatencyWithBoost,
-         consts.frameLimitUs 
-     };
-     LL_CHECK(NvLL_VK_SetSleepMode(m_device, &params));
-     return ComputeStatus::eOk;
+     CHECK_REFLEX();
+     return m_reflex->setSleepMode(consts);
  }
 
  ComputeStatus Vulkan::getSleepStatus(ReflexState& settings)
  {
-     NVLL_VK_GET_SLEEP_STATUS_PARAMS params{};
-     LL_CHECK(NvLL_VK_GetSleepStatus(m_device, &params));
-     return ComputeStatus::eOk;
+     CHECK_REFLEX();
+     return m_reflex->getSleepStatus(settings);
  }
 
  ComputeStatus Vulkan::getLatencyReport(ReflexState& settings)
  {
-     NVLL_VK_LATENCY_RESULT_PARAMS params{};
-     LL_CHECK(NvLL_VK_GetLatency(m_device, &params));
-     for (auto i = 0; i < 64; i++)
-     {
-         settings.frameReport[i].frameID = params.frameReport[i].frameID;
-         settings.frameReport[i].inputSampleTime = params.frameReport[i].inputSampleTime;
-         settings.frameReport[i].simStartTime = params.frameReport[i].simStartTime;
-         settings.frameReport[i].simEndTime = params.frameReport[i].simEndTime;
-         settings.frameReport[i].renderSubmitStartTime = params.frameReport[i].renderSubmitStartTime;
-         settings.frameReport[i].renderSubmitEndTime = params.frameReport[i].renderSubmitEndTime;
-         settings.frameReport[i].presentStartTime = params.frameReport[i].presentStartTime;
-         settings.frameReport[i].presentEndTime = params.frameReport[i].presentEndTime;
-         settings.frameReport[i].driverStartTime = params.frameReport[i].driverStartTime;
-         settings.frameReport[i].driverEndTime = params.frameReport[i].driverEndTime;
-         settings.frameReport[i].osRenderQueueStartTime = params.frameReport[i].osRenderQueueStartTime;
-         settings.frameReport[i].osRenderQueueEndTime = params.frameReport[i].osRenderQueueEndTime;
-         settings.frameReport[i].gpuRenderStartTime = params.frameReport[i].gpuRenderStartTime;
-         settings.frameReport[i].gpuRenderEndTime = params.frameReport[i].gpuRenderEndTime;
-         settings.frameReport[i].gpuActiveRenderTimeUs = (uint32_t)(params.frameReport[i].gpuRenderEndTime - params.frameReport[i].gpuRenderStartTime);
-         settings.frameReport[i].gpuFrameTimeUs = i == 0 ? 0 : (uint32_t)(params.frameReport[i].gpuRenderEndTime - params.frameReport[i - 1].gpuRenderEndTime);
-     }
-     return ComputeStatus::eOk;
+     CHECK_REFLEX();
+     return m_reflex->getReport(settings);
  }
 
  ComputeStatus Vulkan::sleep()
@@ -3095,37 +3370,25 @@ ComputeStatus Vulkan::getNativeFormat(Format format, NativeFormat& native)
      m_parameters->get(sl::param::interposer::kVKValidationActive, &vkValidationOn);
      if(vkValidationOn) return ComputeStatus::eOk;
 #endif
-
-     reflexSemaphoreValue++;
-     LL_CHECK(NvLL_VK_Sleep(m_device, reflexSemaphoreValue));
-     VkSemaphoreWaitInfo waitInfo;
-     waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-     waitInfo.pNext = NULL;
-     waitInfo.flags = 0;
-     waitInfo.semaphoreCount = 1;
-     waitInfo.pSemaphores = &m_lowLatencySemaphore;
-     waitInfo.pValues = &reflexSemaphoreValue;
-     m_ddt.WaitSemaphores(m_device, &waitInfo, kMaxSemaphoreWaitUs);
-     return ComputeStatus::eOk;
+     CHECK_REFLEX();
+     return m_reflex->sleep();
  }
 
- ComputeStatus Vulkan::setReflexMarker(ReflexMarker marker, uint64_t frameId)
+ ComputeStatus Vulkan::setReflexMarker(PCLMarker marker, uint64_t frameId)
  {
-     NVLL_VK_LATENCY_MARKER_PARAMS params{ frameId, (NVLL_VK_LATENCY_MARKER_TYPE)marker };
-     LL_CHECK(NvLL_VK_SetLatencyMarker(m_device, &params));
-     return ComputeStatus::eOk;
+     CHECK_REFLEX();
+     return m_reflex->setMarker(marker, frameId);
  }
 
  ComputeStatus Vulkan::notifyOutOfBandCommandQueue(CommandQueue queue, OutOfBandCommandQueueType type)
  {
-     LL_CHECK(NvLL_VK_NotifyOutOfBandQueue(m_device, (VkQueue)((CommandQueueVk*)queue)->native, (NVLL_VK_OUT_OF_BAND_QUEUE_TYPE)type));
-     return ComputeStatus::eOk;
+     CHECK_REFLEX();
+     return m_reflex->notifyOutOfBandCommandQueue(queue, type);
  }
- ComputeStatus Vulkan::setAsyncFrameMarker(CommandQueue queue, ReflexMarker marker, uint64_t frameId)
+ ComputeStatus Vulkan::setAsyncFrameMarker(CommandQueue queue, PCLMarker marker, uint64_t frameId)
  {
-     NVLL_VK_LATENCY_MARKER_PARAMS params{ frameId, (NVLL_VK_LATENCY_MARKER_TYPE)marker };
-     LL_CHECK(NvLL_VK_SetLatencyMarker(m_device, &params));
-     return ComputeStatus::eOk;
+     CHECK_REFLEX();
+     return m_reflex->setAsyncFrameMarker(queue, marker, frameId);
  }
 }
 }

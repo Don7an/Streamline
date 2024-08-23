@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -40,10 +40,10 @@ constexpr const char* kPFunAllocateResource = "sl.param.global.allocateResource"
 constexpr const char* kPFunReleaseResource = "sl.param.global.releaseResource";
 constexpr const char* kPluginPath = "sl.param.global.pluginPath";
 constexpr const char* kLogInterface = "sl.param.global.logInterface";
-constexpr const char* kPluginManagerInterface = "sl.param.global.pluginManagerInterface";
 constexpr const char* kOTAInterface = "sl.param.global.otaInterface";
 constexpr const char* kNGXContext = "sl.param.global.ngxContext";
 constexpr const char* kNGXContextD3D12 = "sl.param.global.ngxContextD3D12";
+constexpr const char* kDRSContext = "sl.param.global.drsContext";
 constexpr const char* kSwapchainBufferCount = "sl.param.global.swapchainbuffercount";
 constexpr const char* kDebugMode = "sl.param.global.dbgMode";
 constexpr const char* kPFunGetTag = "sl.param.global.getTag";
@@ -114,8 +114,27 @@ namespace latency
 
 constexpr const char* kCurrentFrame = "sl.param.latency.frame";
 constexpr const char* kMarkerFrame = "sl.param.latency.markerFrame";
+//! DEPRECATED (reflex-pcl):
 constexpr const char* kPFunSetLatencyStatsMarker = "sl.param.latency.setLatencyStatsMarker";
 
+}
+
+namespace pcl
+{
+constexpr const char* kPFunSetPCLStatsMarker = "sl.param.pcl.setPCLStatsMarker";
+}
+
+//! DEPRECATED (reflex-pcl):
+//! These should only be used to bridge Reflex and PCL plugins.
+namespace _deprecated_reflex_pcl
+{
+    constexpr const char* kSlSetData = "sl.param._deprecated_reflex_pcl.slSetData";
+    constexpr const char* kSlGetData = "sl.param._deprecated_reflex_pcl.slGetData";
+}
+
+namespace deepDVC
+{
+constexpr const char* kCurrentFrame = "sl.param.deepdvc.frame";
 }
 
 namespace debug_plugin
@@ -130,6 +149,12 @@ namespace imgui
 {
 constexpr const char* kInterface = "sl.param.imgui.interface";
 }
+
+namespace dlss_d
+{
+constexpr const char* kCurrentFrame = "sl.param.dlss_d.frame";
+}
+
 struct IParameters
 {
     virtual void set(const char* key, bool value) = 0;

@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -26,6 +26,10 @@
 #include "include/sl_reflex.h"
 #include "source/core/sl.extra/extra.h"
 
+#if defined(SL_DEBUG)
+#define ASSERT_ONLY_CODE 1
+#endif
+
 namespace sl
 {
 
@@ -42,6 +46,7 @@ using Device = void*;
 using PhysicalDevice = void*;
 using Instance = void*;
 using Resource = sl::Resource*;
+using SubresourceRange = sl::SubresourceRange*;
 using ResourceView = void*;
 using Kernel = size_t;
 using CommandList = void*;
@@ -99,6 +104,7 @@ enum Format
     eFormatRG32UI,
     eFormatD32S32,
     eFormatD24S8,
+    eFormatD32S8U,
     eFormatCOUNT,
 };
 
@@ -147,8 +153,9 @@ enum class ResourceState : uint32_t
     eColorAttachmentRead = 1 << 8,
     eColorAttachmentWrite = 1 << 9,
     eColorAttachmentRW = eColorAttachmentRead | eColorAttachmentWrite,
-    eDepthStencilAttachmentWrite = 1 << 10,
     eDepthStencilAttachmentRead = 1 << 11,
+    eDepthStencilAttachmentWrite = 1 << 10,
+    eDepthStencilAttachmentRW = eDepthStencilAttachmentRead | eDepthStencilAttachmentWrite,
     eCopySource = 1 << 12,
     eCopyDestination = 1 << 13,
     eAccelStructRead = 1 << 14,
@@ -262,6 +269,7 @@ struct ResourceDescription
     ResourceState state = ResourceState::eUnknown;
     uint64_t gpuVirtualAddress = 0;
     ResourceFlags flags = ResourceFlags::eNone;
+    std::string sName;
 };
 
 struct ResourceInfo
@@ -372,25 +380,36 @@ enum class WaitStatus
     eError,
 };
 
+struct DebugInfo
+{
+    DebugInfo(const char* sFile, uint32_t uLine) : m_sFile(sFile), m_uLine(uLine) { }
+    DebugInfo() : m_sFile("NO_FILE") { }
+    const char* m_sFile = nullptr;
+    uint32_t m_uLine = 0;
+};
+
 struct ICommandListContext
 {
     virtual RenderAPI getType() = 0;
-    virtual uint32_t getBufferCount() = 0;
+    virtual uint32_t getPrevCommandListIndex() = 0;
     virtual uint32_t getCurrentCommandListIndex() = 0;
     virtual uint64_t getSyncValueAtIndex(uint32_t idx) = 0;
-    virtual SyncPoint getNextSyncPoint() = 0;
+    virtual SyncPoint getSyncPointAtIndex(uint32_t idx) = 0;
+    virtual Fence getNextVkAcquireFence() = 0;
     virtual int acquireNextBufferIndex(SwapChain chain, uint32_t& index, Fence* waitSemaphore = nullptr) = 0;
     virtual bool isCommandListRecording() = 0;
     virtual bool beginCommandList() = 0;
     virtual bool executeCommandList(const GPUSyncInfo* info = nullptr) = 0;
     virtual WaitStatus flushAll() = 0;
     virtual void syncGPU(const GPUSyncInfo* info) = 0;
-    virtual void waitOnGPUForTheOtherQueue(const ICommandListContext* other, uint32_t clIndex, uint64_t syncValue) = 0;
+    virtual void waitOnGPUForTheOtherQueue(const ICommandListContext* other, uint32_t clIndex,
+        uint64_t syncValue, const DebugInfo &debugInfo) = 0;
     virtual WaitStatus waitCPUFence(Fence fence, uint64_t syncValue) = 0;
-    virtual void waitGPUFence(Fence fence, uint64_t syncValue) = 0;
-    virtual void signalGPUFence(Fence fence, uint64_t syncValue) = 0;
-    virtual void signalGPUFenceAt(uint32_t index) = 0;
+    virtual void waitGPUFence(Fence fence, uint64_t syncValue, const DebugInfo &debugInfo) = 0;
+    virtual bool signalGPUFence(Fence fence, uint64_t syncValue) = 0;
+    virtual bool signalGPUFenceAt(uint32_t index) = 0;
     virtual WaitStatus waitForCommandList(FlushType ft = FlushType::eDefault) = 0;
+    virtual uint64_t getCompletedValue(Fence fence) = 0;
     virtual bool didCommandListFinish(uint32_t index) = 0;
     virtual WaitStatus waitForCommandListToFinish(uint32_t index) = 0;
     virtual CommandList getCmdList() = 0;
@@ -404,16 +423,59 @@ struct ICommandListContext
     virtual void waitForVblank(SwapChain chain) = 0;
 };
 
-struct HashedResource
+// HashedResource uses std::shared_ptr<> to keep track of references to the underlying
+// HashedResourceData object. As soon as nobody references the HashedResourceData, the
+// destructor for it would be called, which will use the cached m_pCompute pointer to
+// release the underlying chi::Resource
+struct HashedResourceData
 {
+    HashedResourceData(sl::Resource* pResource, class ICompute* pCompute, bool bOwnResource);
+    ~HashedResourceData();
     uint64_t hash{};
     ResourceState state{};
     Resource resource{};
+private:
+    HashedResourceData(const HashedResourceData&) = delete;
+    void operator=(const HashedResourceData&) = delete;
+    ICompute* m_pCompute{};
+    bool m_bOwnResource = false; // if true, we will call destroyResource() in destructor
+    IUnknown* m_pNative = nullptr;
+};
+struct HashedResource
+{
+    HashedResource(uint64_t hash, ResourceState state, Resource resource, ICompute* pCompute, bool bOwnResource)
+    {
+        if (resource)
+        {
+		    assert(resource->native);
+            m_p = std::make_shared<HashedResourceData>(resource, pCompute, bOwnResource);
+            m_p->hash = hash;
+            m_p->state = state;
+        }
+    }
+    HashedResource(uint64_t hash, Resource resource, ICompute* pCompute, bool bOwnResource);
+    HashedResource() { }
 
-    inline operator bool() const { return resource != nullptr; }
-    inline operator bool() { return resource != nullptr; }
-    inline operator Resource() { return resource; }
-    inline operator Resource() const { return resource; }
+    inline operator bool() const { return m_p != nullptr; }
+    inline bool operator ==(const HashedResource& other) const { return m_p == other.m_p; }
+    inline operator Resource() const { return m_p ? m_p->resource : nullptr; }
+    ResourceState &accessState() { return m_p ? m_p->state : s_invalidState; }
+    ResourceState getState() const { return m_p ? m_p->state : ResourceState::eUnknown; }
+    uint64_t& accessHash() { return m_p ? m_p->hash : s_invalidHash; }
+    void* getNative() const { return m_p ? m_p->resource->native : nullptr; }
+#if ASSERT_ONLY_CODE
+    bool dbgIsCorrupted() const
+    {
+        // The value 0xDD is used by the Visual C++ debugger to fill memory that has been freed or
+        // released. This is done to help identify memory leaks and other memory - related errors.
+        return m_p ? (uint64_t &)m_p->resource->native == 0xdddddddddddddddd : false;
+    }
+#endif
+
+private:
+    std::shared_ptr<HashedResourceData> m_p;
+    static ResourceState s_invalidState;
+    static uint64_t s_invalidHash;
 };
 
 struct IResourcePool
@@ -462,11 +524,27 @@ enum FenceFlags : uint32_t
 
 SL_ENUM_OPERATORS_32(FenceFlags)
 
-#define CHI_VALIDATE(f) {auto r = f; if(r != sl::chi::ComputeStatus::eOk) { SL_LOG_ERROR( "%s failed", #f); } };
-#define CHI_CHECK(f) {auto _r = f;if(_r != sl::chi::ComputeStatus::eOk) { SL_LOG_ERROR( "%s failed",#f); return _r;}};
-#define CHI_CHECK_RF(f) {auto _r = f;if(_r != sl::chi::ComputeStatus::eOk) { SL_LOG_ERROR( "%s failed",#f); return false;}};
-#define CHI_CHECK_RV(f) {auto _r = f;if(_r != sl::chi::ComputeStatus::eOk) { SL_LOG_ERROR( "%s failed",#f); return;}};
-#define CHI_CHECK_RR(f) {auto _r = f;if(_r != sl::chi::ComputeStatus::eOk) { SL_LOG_ERROR( "%s failed",#f); return sl::Result::eErrorComputeFailed;}};
+inline const char* getComputeStatusAsStr(ComputeStatus status)
+{
+    switch (status)
+    {
+        case ComputeStatus::eOk: return "Ok";
+        case ComputeStatus::eError: return "Error";
+        case ComputeStatus::eNoImplementation: return "NoImplementation";
+        case ComputeStatus::eInvalidArgument: return "InvalidArgument";
+        case ComputeStatus::eInvalidPointer: return "InvalidPointer";
+        case ComputeStatus::eNotSupported: return "NotSupported";
+        case ComputeStatus::eInvalidCall: return "InvalidCall";
+        case ComputeStatus::eNotReady: return "NotReady";
+        default: return "Unknown";
+    }
+}
+
+#define CHI_VALIDATE(f) {auto r = f; if(r != sl::chi::ComputeStatus::eOk) { SL_LOG_ERROR("%s failed %d (%s)", #f, r, getComputeStatusAsStr(r)); } };
+#define CHI_CHECK(f) {auto _r = f;if(_r != sl::chi::ComputeStatus::eOk) { SL_LOG_ERROR("%s failed %d (%s)", #f, _r, getComputeStatusAsStr(_r)); return _r;}};
+#define CHI_CHECK_RF(f) {auto _r = f;if(_r != sl::chi::ComputeStatus::eOk) { SL_LOG_ERROR("%s failed %d (%s)", #f, _r, getComputeStatusAsStr(_r)); return false;}};
+#define CHI_CHECK_RV(f) {auto _r = f;if(_r != sl::chi::ComputeStatus::eOk) { SL_LOG_ERROR("%s failed %d (%s)", #f, _r, getComputeStatusAsStr(_r)); return;}};
+#define CHI_CHECK_RR(f) {auto _r = f;if(_r != sl::chi::ComputeStatus::eOk) { SL_LOG_ERROR("%s failed %d (%s)", #f, _r, getComputeStatusAsStr(_r)); return sl::Result::eErrorComputeFailed;}};
 #define NVAPI_CHECK(f) {auto r = f; if(r != NVAPI_OK) { SL_LOG_ERROR_ONCE( "%s failed error %d", #f, r); return sl::chi::ComputeStatus::eError;} };
 
 class ICompute
@@ -479,6 +557,8 @@ public:
     virtual ComputeStatus getDevice(Device& device) = 0;
     virtual ComputeStatus getInstance(Instance& instance) = 0;
     virtual ComputeStatus getPhysicalDevice(PhysicalDevice& device) = 0;
+    virtual ComputeStatus getHostQueueInfo(chi::CommandQueue queue, void* pQueueInfo) = 0;
+
     virtual ComputeStatus waitForIdle(Device device) = 0;
 
     virtual ComputeStatus clearCache() = 0;
@@ -504,7 +584,7 @@ public:
     virtual ComputeStatus setCallbacks(PFun_ResourceAllocateCallback allocate, PFun_ResourceReleaseCallback release, PFun_GetThreadContext getThreadContext) = 0;
 
     virtual ComputeStatus destroyKernel(Kernel& kernel) = 0;
-    virtual ComputeStatus destroyFence(Fence fence) = 0;
+    virtual ComputeStatus destroyFence(Fence& fence) = 0;
     //! NOTE: Resource destroy methods by default are delayed by 3 frames
     //! 
     //! To trigger immediate resource release set frameDelay to 0
@@ -545,8 +625,8 @@ public:
     virtual ComputeStatus bindRawBuffer(uint32_t binding, uint32_t reg, Resource resource) = 0;
     virtual ComputeStatus dispatch(uint32_t blockX, uint32_t blockY, uint32_t blockZ = 1) = 0;
     
-    virtual ComputeStatus startTrackingResource(uint32_t id, Resource resource) = 0;
-    virtual ComputeStatus stopTrackingResource(uint32_t id) = 0;
+    virtual ComputeStatus startTrackingResource(uint64_t uid, Resource resource) = 0;
+    virtual ComputeStatus stopTrackingResource(uint64_t uid, Resource dbgResource) = 0;
 
     // Hooks up back to the SL command list to restore its state
     virtual ComputeStatus restorePipeline(CommandList cmdList) = 0;
@@ -598,9 +678,9 @@ public:
     virtual ComputeStatus getSleepStatus(ReflexState& settings) = 0;
     virtual ComputeStatus getLatencyReport(ReflexState& settings) = 0;
     virtual ComputeStatus sleep() = 0;
-    virtual ComputeStatus setReflexMarker(ReflexMarker marker, uint64_t frameId) = 0;
+    virtual ComputeStatus setReflexMarker(PCLMarker marker, uint64_t frameId) = 0;
     virtual ComputeStatus notifyOutOfBandCommandQueue(CommandQueue queue, OutOfBandCommandQueueType type) = 0;
-    virtual ComputeStatus setAsyncFrameMarker(CommandQueue queue, ReflexMarker marker, uint64_t frameId) = 0;
+    virtual ComputeStatus setAsyncFrameMarker(CommandQueue queue, PCLMarker marker, uint64_t frameId) = 0;
     
     // Sharing API
     virtual ComputeStatus fetchTranslatedResourceFromCache(ICompute* otherAPI, ResourceType type, Resource res, TranslatedResource& shared, const char friendlyName[] = "") = 0;
@@ -617,6 +697,47 @@ public:
 ICompute* getD3D11();
 ICompute *getD3D12();
 ICompute *getVulkan();
+
+inline HashedResourceData::HashedResourceData(sl::Resource *pResource, ICompute* pCompute, bool bOwnResource) :
+    resource(pResource),
+    m_pCompute(pCompute),
+    m_bOwnResource(bOwnResource)
+{
+    assert(m_pCompute && resource && resource->native);
+    RenderAPI api = RenderAPI::eD3D12;
+    m_pCompute->getRenderAPI(api);
+    if (api != RenderAPI::eVulkan)
+    {
+        // if we don't own the resource pointer - someone may delete it from under us. so
+        // cache the pointer to native IUnknown here. that way we will be able to Release()
+        // it in ~HashedResourceData()
+        m_pNative = ((IUnknown*)resource->native);
+        m_pNative->AddRef();
+    }
+}
+inline HashedResourceData::~HashedResourceData()
+{
+    if (m_pNative)
+    {
+        m_pNative->Release();
+    }
+    if (m_bOwnResource)
+    {
+        assert(m_pCompute && resource && resource->native);
+        m_pCompute->destroyResource(resource, 0);
+    }
+}
+inline HashedResource::HashedResource(uint64_t hash, Resource resource, ICompute* pCompute, bool bOwnResource)
+{
+    if (resource)
+    {
+        assert(resource->native && pCompute);
+        m_p = std::make_shared<HashedResourceData>(resource, pCompute, bOwnResource);
+        m_p->hash = hash;
+        pCompute->getResourceState(resource, m_p->state);
+    }
+}
+
 
 }
 }

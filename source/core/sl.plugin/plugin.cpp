@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -80,10 +80,7 @@ void onLoad(api::Context* ctx, const char* loaderJSON, const char* embeddedJSON)
             stream >> loader;
         }
 
-        {
-            std::istringstream stream(embeddedJSON);
-            stream >> config;
-        }
+        config = json::parse(embeddedJSON, nullptr, /* allow exceptions: */ true, /* ignore comments: */ true);
 
         auto pluginVersion = api::getContext()->pluginVersion;
         auto apiVersion = api::getContext()->apiVersion;

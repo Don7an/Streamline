@@ -2,6 +2,37 @@ require("vstudio")
 
 local ROOT = "./"
 
+nvcfg = {}
+
+
+nvcfg.SL_BUILD_DLSS_DN = true
+
+
+
+
+
+nvcfg.SL_BUILD_DEEPDVC = true
+
+nvcfg.SL_DEEPDVC_PUBLIC_SDK = true
+
+
+
+
+newoption {
+	trigger = "with-nvllvk",
+	description = "Use NvLowLatencyVk",
+	allowed = {
+		{"yes", "yes"},
+		{"no", "no"}
+	},
+	default = "yes"
+}
+
+newoption {
+	trigger = "with-toolset",
+	description = "Specify premake toolset"
+}
+
 function os.winSdkVersion()
     local reg_arch = iif( os.is64bit(), "\\Wow6432Node\\", "\\" )
     local sdk_version = os.getWindowsRegistry( "HKLM:SOFTWARE" .. reg_arch .."Microsoft\\Microsoft SDKs\\Windows\\v10.0\\ProductVersion" )
@@ -17,17 +48,27 @@ workspace "streamline"
 	-- Where the project files (vs project, solution, etc) go
 	location( ROOT .. "_project/" .. project_action)
 
-	configurations { "Debug", "Release", "Production", "Profiling", "RelExtDev" }
-	platforms { "x64"}
+	configurations { "Debug", "Develop", "Production" }
+	platforms { "x64" }
 	architecture "x64"
 	language "c++"
 	preferredtoolarchitecture "x86_64"
+	if (_OPTIONS["with-toolset"]) then
+		toolset (_OPTIONS["with-toolset"])
+	end
+	
 		  
 	local externaldir = (ROOT .."external/")
 
 	includedirs 
 	{ 
-		".", ROOT		
+		".", ROOT,
+		externaldir .. "json/include/",
+		externaldir .. "perf-sdk/include",
+		externaldir .. "perf-sdk/include",
+		externaldir .. "perf-sdk/include/windows-desktop-x64",
+		externaldir .. "perf-sdk/NvPerfUtility/include",
+		externaldir .. "vulkan/Include"
 	}
    	 
 	if os.host() == "windows" then
@@ -45,7 +86,10 @@ workspace "streamline"
 	filter {"system:windows", "action:vs*"}
 		flags { "MultiProcessorCompile", "NoMinimalRebuild"}		
 		
-		
+	flags { "FatalWarnings" }
+	-- Enable additional warnings: https://premake.github.io/docs/warnings
+	--warnings "Extra"
+
 	-- building makefiles
 	cppdialect "C++20"
 	
@@ -53,47 +97,51 @@ workspace "streamline"
 		defines { "DEBUG", "_DEBUG", "SL_ENABLE_TIMING=1", "SL_DEBUG" }
 		symbols "Full"
 				
-	filter "configurations:Release"
-		defines { "NDEBUG","SL_ENABLE_TIMING=1", "SL_RELEASE" }
+	filter "configurations:Develop"
+		defines { "NDEBUG","SL_ENABLE_TIMING=0","SL_ENABLE_PROFILING=0", "SL_DEVELOP" }
 		optimize "On"
-		flags { "LinkTimeOptimization" }		
-		
-	filter "configurations:Profiling"
-		defines { "NDEBUG","SL_ENABLE_TIMING=0","SL_ENABLE_PROFILING=1", "SL_PROFILING" }
-		optimize "On"
-		flags { "LinkTimeOptimization" }		
+		flags { "LinkTimeOptimization" }
 
 	filter "configurations:Production"
 		defines { "NDEBUG","SL_ENABLE_TIMING=0","SL_ENABLE_PROFILING=0","SL_PRODUCTION" }
 		optimize "On"
-		flags { "LinkTimeOptimization" }		
-
-	filter "configurations:RelExtDev"
-		defines { "NDEBUG","SL_ENABLE_TIMING=0","SL_ENABLE_PROFILING=0", "SL_REL_EXT_DEV" }
-		optimize "On"
-		flags { "LinkTimeOptimization" }		
+		flags { "LinkTimeOptimization" }
 
 	filter { "files:**.hlsl" }
 		buildmessage 'Compiling shader %{file.relpath} to DXBC/SPIRV with slang'
         buildcommands {				
-			path.translate("../../external/slang_internal/bin/windows-x64/release/")..'slangc "%{file.relpath}" -entry main -target spirv -o "../../_artifacts/shaders/%{file.basename}.spv"',
-			path.translate("../../external/slang_internal/bin/windows-x64/release/")..'slangc "%{file.relpath}" -profile sm_5_0 -entry main -target dxbc -o "../../_artifacts/shaders/%{file.basename}.cs"',
+			path.translate("../../external/slang/bin/windows-x64/release/")..'slangc "%{file.relpath}" -entry main -target spirv -o "../../_artifacts/shaders/%{file.basename}.spv"',
+			path.translate("../../external/slang/bin/windows-x64/release/")..'slangc "%{file.relpath}" -profile sm_5_0 -entry main -target dxbc -o "../../_artifacts/shaders/%{file.basename}.cs"',
 			'pushd '..path.translate("../../_artifacts/shaders"),
-			path.translate("../../tools/")..'xxd --include "%{file.basename}.spv"  > "%{file.basename}_spv.h"',
-			path.translate("../../tools/")..'xxd --include "%{file.basename}.cs"  > "%{file.basename}_cs.h"',
+			'powershell.exe -NoProfile -ExecutionPolicy Bypass '..path.translate("../../tools/")..'bin2cheader.ps1 -i "%{file.basename}.spv"  > "%{file.basename}_spv.h"',
+			'powershell.exe -NoProfile -ExecutionPolicy Bypass '..path.translate("../../tools/")..'bin2cheader.ps1 -i "%{file.basename}.cs"  > "%{file.basename}_cs.h"',
 			'popd'
 		 }	  
 		 -- One or more outputs resulting from the build (required)
 		 buildoutputs { ROOT .. "_artifacts/shaders/%{file.basename}.spv", ROOT .. "_artifacts/shaders/%{file.basename}.cs" }	  
 		 -- One or more additional dependencies for this build command (optional)
 		 --buildinputs { 'path/to/file1.ext', 'path/to/file2.ext' }
+	
+	filter { "files:**.json" }
+		buildmessage 'Compiling %{file.relpath} to %{file.basename}_json.h'
+		buildcommands {
+			'copy "%{file.relpath}" "../../_artifacts/json/%{file.name}"',
+			'pushd '..path.translate("../../_artifacts/json"),
+			'powershell.exe -NoProfile -ExecutionPolicy Bypass '..path.translate("../../tools/")..'bin2cheader.ps1 -i "%{file.basename}.json"  > "../../_artifacts/json/%{file.basename}_json.h"',
+			'popd'
+		}
+		-- One or more outputs resulting from the build (required)
+		buildoutputs { ROOT .. "_artifacts/json/%{file.basename}.json"}	  
+		-- One or more additional dependencies for this build command (optional)
+		-- buildinputs { 'path/to/file1.ext', 'path/to/file2.ext' }
 
 	filter {}
 
 	filter {} -- clear filter when you know you no longer need it!
 	
 	vpaths { ["shaders"] = {"**.hlsl" } }
-		
+
+
 group "core"
 
 project "sl.interposer"
@@ -108,6 +156,7 @@ project "sl.interposer"
 	else
 		prebuildcommands { 'pushd '..path.translate("../../_artifacts"), path.translate("../tools/").."gitVersion.sh", 'popd' }
 	end
+
 
 	files { 
 		"./include/**.h",
@@ -126,6 +175,7 @@ project "sl.interposer"
 		"./source/core/sl.security/**.cpp",
 		"./source/core/sl.plugin-manager/**.h",
 		"./source/core/sl.plugin-manager/**.cpp",		
+		"./source/core/sl.plugin/inter_plugin_communication.h",
 	}
 
 	if os.host() == "windows" then
@@ -160,6 +210,7 @@ project "sl.interposer"
 	vpaths { ["params"] = {"./source/core/sl.param/**.h","./source/core/sl.param/**.cpp"}}
 	vpaths { ["security"] = {"./source/core/sl.security/**.h","./source/core/sl.security/**.cpp"}}
 	vpaths { ["version"] = {"./source/core/sl.interposer/versions.h","./source/core/sl.interposer/resource.h","./source/core/sl.interposer/**.rc"}}
+	vpaths { ["plugin"] = {"./source/core/sl.plugin/inter_plugin_communication.h",}}
 
 	removefiles 
 	{ 	
@@ -180,8 +231,9 @@ project "sl.compute"
 	staticruntime "off"
 	dependson { "sl.interposer"}
 
+
 	if os.host() == "windows" then
-		if (os.isfile("./external/slang_internal/bin/windows-x64/release/slangc.exe")) then
+		if (os.isfile("./external/slang/bin/windows-x64/release/slangc.exe")) then
 		files {
 			"./shaders/**.hlsl"
 		}
@@ -200,7 +252,11 @@ project "sl.compute"
 			"./source/platforms/sl.chi/generic.cpp",
 			"./source/core/sl.security/**.h",
 			"./source/core/sl.security/**.cpp"
-		}	
+		}
+		filter { "options:with-nvllvk=yes" }
+			defines { "SL_WITH_NVLLVK" }
+			files { "./source/platforms/sl.chi/nvllvk.cpp" }
+		filter {}
 	else
 		files {
 			"./shaders/**.hlsl",
@@ -262,8 +318,9 @@ project "sl.common"
 
 	files { 
 		"./source/core/sl.extra/**.cpp",		
+		"./source/plugins/sl.common/**.json",
 		"./source/plugins/sl.common/**.h", 
-		"./source/plugins/sl.common/**.cpp", 				
+		"./source/plugins/sl.common/**.cpp",
 		"./source/core/ngx/**.h",
 		"./source/core/ngx/**.cpp",		
 		"./source/core/sl.ota/**.cpp",
@@ -273,20 +330,25 @@ project "sl.common"
 	vpaths { ["impl"] = {"./source/plugins/sl.common/**.h", "./source/plugins/sl.common/**.cpp" }}
 	--vpaths { ["ngx"] = {"./source/core/ngx/**.h", "./source/core/ngx/**.cpp"}}
 	
-	libdirs {externaldir .."nvapi/amd64",externaldir .."ngx/Lib/Windows_x86_64/x86_64", externaldir .."pix/bin", externaldir .."reflex-sdk-vk/lib"}
+	libdirs {externaldir .."nvapi/amd64",externaldir .."ngx-sdk/Lib/Windows_x86_64", externaldir .."pix/bin", externaldir .."reflex-sdk-vk/lib"}
 	
     links
     {     
 		"delayimp.lib", "d3d12.lib", "nvapi64.lib", "dxgi.lib", "dxguid.lib", (ROOT .. "_artifacts/sl.compute/%{cfg.buildcfg}_%{cfg.platform}/sl.compute.lib"),
-		"NvLowLatencyVk.lib", "Version.lib"
+		"Version.lib"
 	}
+
     filter "configurations:Debug"
 	 	links { "nvsdk_ngx_d_dbg.lib" }
-	filter "configurations:Release or Production or Profiling or RelExtDev"
+	filter "configurations:Develop or Production"
 		links { "nvsdk_ngx_d.lib"}
 	filter {}
 
-	linkoptions { "/DELAYLOAD:NvLowLatencyVk.dll" }
+	filter { "options:with-nvllvk=yes" }
+		defines { "SL_WITH_NVLLVK" }
+		links { "NvLowLatencyVk.lib" }
+		linkoptions { "/DELAYLOAD:NvLowLatencyVk.dll" }
+	filter {}
 
 if (os.isdir("./source/plugins/sl.dlss_g")) then
 	project "sl.dlss_g"
@@ -298,8 +360,9 @@ if (os.isdir("./source/plugins/sl.dlss_g")) then
 		pluginBasicSetup("dlss_g")
 
 		files { 
+			"./source/plugins/sl.dlss_g/**.json",
 			"./source/plugins/sl.dlss_g/**.h", 
-			"./source/plugins/sl.dlss_g/**.cpp", 		
+			"./source/plugins/sl.dlss_g/**.cpp",
 		}
 
 		links {"external/nvapi/amd64/nvapi64.lib"}
@@ -320,8 +383,9 @@ project "sl.dlss"
 	files { 
 		"./source/core/ngx/**.h",
 		"./source/core/ngx/**.cpp",		
-		"./source/plugins/sl.dlss/**.h", 
-		"./source/plugins/sl.dlss/**.cpp"		
+		"./source/plugins/sl.dlss/**.json",
+		"./source/plugins/sl.dlss/**.h",
+		"./source/plugins/sl.dlss/**.cpp"
 	}
 
 	vpaths { ["impl"] = {"./source/plugins/sl.dlss/**.h", "./source/plugins/sl.dlss/**.cpp" }}
@@ -339,8 +403,9 @@ project "sl.nrd"
 	pluginBasicSetup("nrd")
 	
 	files { 
-		"./source/plugins/sl.nrd/**.h", 
-		"./source/plugins/sl.nrd/**.cpp"		
+		"./source/plugins/sl.nrd/**.json",
+		"./source/plugins/sl.nrd/**.h",
+		"./source/plugins/sl.nrd/**.cpp"
 	}
 
 	vpaths { ["impl"] = {"./source/plugins/sl.nrd/**.h", "./source/plugins/sl.nrd/**.cpp" }}
@@ -357,11 +422,30 @@ project "sl.reflex"
 	pluginBasicSetup("reflex")
 	
 	files { 
-		"./source/plugins/sl.reflex/**.h", 
-		"./source/plugins/sl.reflex/**.cpp"		
+		"./source/plugins/sl.reflex/**.json", 
+		"./source/plugins/sl.reflex/**.h",
+		"./source/plugins/sl.reflex/**.cpp"
 	}
 
 	vpaths { ["impl"] = {"./source/plugins/sl.reflex/**.h", "./source/plugins/sl.reflex/**.cpp" }}
+			
+	removefiles {"./source/core/sl.extra/extra.cpp"}
+
+project "sl.pcl"
+	kind "SharedLib"
+	targetdir (ROOT .. "_artifacts/%{prj.name}/%{cfg.buildcfg}_%{cfg.platform}")
+	objdir (ROOT .. "_artifacts/%{prj.name}/%{cfg.buildcfg}_%{cfg.platform}") 
+	characterset ("MBCS")
+	pluginBasicSetup("pcl")
+	
+	files { 
+		"./source/plugins/sl.pcl/**.json",
+		"./source/plugins/sl.pcl/**.h",
+		"./source/plugins/sl.pcl/**.cpp"
+
+	}
+
+	vpaths { ["impl"] = {"./source/plugins/sl.pcl/**.h", "./source/plugins/sl.pcl/**.cpp" }}
 			
 	removefiles {"./source/core/sl.extra/extra.cpp"}
    	
@@ -373,8 +457,9 @@ project "sl.template"
 	pluginBasicSetup("template")
 	
 	files { 
-		"./source/plugins/sl.template/**.h", 
-		"./source/plugins/sl.template/**.cpp"		
+		"./source/plugins/sl.template/**.json",
+		"./source/plugins/sl.template/**.h",
+		"./source/plugins/sl.template/**.cpp"
 	}
 
 	vpaths { ["impl"] = {"./source/plugins/sl.template/**.h", "./source/plugins/sl.template/**.cpp" }}
@@ -391,6 +476,7 @@ project "sl.nis"
 	pluginBasicSetup("nis")
 
 	files {
+		"./source/plugins/sl.nis/**.json",
 		"./source/plugins/sl.nis/**.h",
 		"./source/plugins/sl.nis/**.cpp"
 	}
@@ -398,6 +484,30 @@ project "sl.nis"
 	vpaths { ["impl"] = {"./source/plugins/sl.nis/**.h", "./source/plugins/sl.nis/**.cpp" }}
 
 	removefiles {"./source/core/sl.extra/extra.cpp"}
+
+if nvcfg.SL_BUILD_DEEPDVC then
+project "sl.deepdvc"
+	kind "SharedLib"
+	targetdir (ROOT .. "_artifacts/%{prj.name}/%{cfg.buildcfg}_%{cfg.platform}")
+	objdir (ROOT .. "_artifacts/%{prj.name}/%{cfg.buildcfg}_%{cfg.platform}")
+	characterset ("MBCS")
+	dependson { "sl.compute"}
+	dependson { "sl.common"}
+	pluginBasicSetup("deepdvc")
+
+	files {
+		"./source/core/ngx/**.h",
+		"./source/core/ngx/**.cpp",
+		"./source/plugins/sl.deepdvc/**.json",
+		"./source/plugins/sl.deepdvc/**.h",
+		"./source/plugins/sl.deepdvc/**.cpp"
+	}
+
+	vpaths { ["impl"] = {"./source/plugins/sl.deepdvc/**.h", "./source/plugins/sl.deepdvc/**.cpp" }}
+	vpaths { ["ngx"] = {"./source/core/ngx/**.h", "./source/core/ngx/**.cpp"}}
+
+	removefiles {"./source/core/sl.extra/extra.cpp"}
+end
 
 project "sl.imgui"
 	kind "SharedLib"
@@ -408,6 +518,7 @@ project "sl.imgui"
 	pluginBasicSetup("nis")
 
 	files {
+		"./source/plugins/sl.imgui/**.json",
 		"./source/plugins/sl.imgui/**.h",
 		"./source/plugins/sl.imgui/**.cpp",
 		"./external/imgui/imgui*.cpp",
@@ -421,6 +532,10 @@ project "sl.imgui"
 	vpaths { ["imgui"] = {"./external/imgui/**.cpp" }}
 	
 	defines {"ImDrawIdx=unsigned int"}
+
+	-- For warning in ryml_all.hpp:
+	-- warning C4996: 'std::aligned_storage': warning STL4034: std::aligned_storage and std::aligned_storage_t are deprecated in C++23. Prefer alignas(T) std::byte t_buff[sizeof(T)].
+	defines {"_SILENCE_CXX23_ALIGNED_STORAGE_DEPRECATION_WARNING"}
 	
 	removefiles {"./source/core/sl.extra/extra.cpp"}
 
@@ -428,4 +543,33 @@ project "sl.imgui"
 
 	links { "d3d12.lib", "vulkan-1.lib"}
 	
+
+if (os.isdir("./source/plugins/sl.nvperf")) then
+	project "sl.nvperf"
+		kind "SharedLib"	
+		targetdir (ROOT .. "_artifacts/%{prj.name}/%{cfg.buildcfg}_%{cfg.platform}")
+		objdir (ROOT .. "_artifacts/%{prj.name}/%{cfg.buildcfg}_%{cfg.platform}") 
+		characterset ("MBCS")
+		dependson { "sl.imgui"}
+		pluginBasicSetup("nvperf")
+		
+		files { 
+			"./source/plugins/sl.nvperf/**.json",
+			"./source/plugins/sl.nvperf/**.h",
+			"./source/plugins/sl.nvperf/**.cpp"
+		}
+
+		vpaths { ["impl"] = {"./source/plugins/sl.nvperf/**.h", "./source/plugins/sl.nvperf/**.cpp" }}
+
+		-- For warning in ryml_all.hpp:
+		-- warning C4996: 'std::aligned_storage': warning STL4034: std::aligned_storage and std::aligned_storage_t are deprecated in C++23. Prefer alignas(T) std::byte t_buff[sizeof(T)].
+		defines {"_SILENCE_CXX23_ALIGNED_STORAGE_DEPRECATION_WARNING"}
+				
+		removefiles {"./source/core/sl.extra/extra.cpp"}
+		
+		libdirs {externaldir .."vulkan/Lib"}
+
+		links { "d3d12.lib", "vulkan-1.lib"}
+end
+
 group ""

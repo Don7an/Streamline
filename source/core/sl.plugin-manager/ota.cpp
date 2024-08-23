@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -147,9 +147,17 @@ namespace ota
         SL_LOG_VERBOSE("execThreadProc: %ls", command.c_str());
 
         // Append a '\n' here so that SL uses "unformatted" logs. The output
-        // from the NGX updater is formatted already with timestamps, no need to
-        // insert our own.
-        SL_LOG_VERBOSE("%s\n", output.c_str());
+        // from the NGX updater is formatted already with timestamps, so we
+        // want to remove them before adding our own.
+        // Safety note: Passing this directly to the `fmt` parameter of `logva`
+        // is safe because the '\n' at the end skips formatting. Using "%s\n"
+        // would make the logger skip formatting and print "%s" instead of the
+        // intended message.
+        if (!output.empty())
+        {
+            output += '\n';
+            SL_LOG_VERBOSE(output.c_str());
+        }
     }
 
 struct OTA : IOTA
@@ -168,29 +176,6 @@ struct OTA : IOTA
 
     bool getNGXPath(std::wstring &ngxPath) const
     {
-        auto getDwordRegKey = [&](HKEY InKey, const WCHAR *InValueName, DWORD *OutValue)->LONG
-        {
-            DWORD dwordSize = sizeof(DWORD);
-            ULONG nError = RegGetValueW(InKey, NULL, InValueName, RRF_RT_REG_DWORD, NULL, (LPBYTE)OutValue, &dwordSize);
-            return nError;
-        };
-
-        auto getDwordFromRegistry = [&](const WCHAR *InRegKeyHive, const WCHAR *InRegKeyName, DWORD *OutValue)->bool
-        {
-            HKEY Key;
-            LONG Res = RegOpenKeyExW(HKEY_LOCAL_MACHINE, InRegKeyHive, 0, KEY_READ, &Key);
-            if (Res == ERROR_SUCCESS)
-            {
-                Res = getDwordRegKey(Key, InRegKeyName, OutValue);
-                RegCloseKey(Key);
-                if (Res == ERROR_SUCCESS)
-                {
-                    return true;
-                }
-            }
-            return false;
-        };
-
         std::wstring path = L"";
         PWSTR programDataPath = NULL;
         HRESULT hr = SHGetKnownFolderPath(FOLDERID_ProgramData, 0, NULL, &programDataPath);
@@ -203,7 +188,7 @@ struct OTA : IOTA
 
         bool useStagingCDN = false;
         DWORD CDNServerType;
-        if (getDwordFromRegistry(L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", L"CDNServerType", &CDNServerType))
+        if (extra::getRegistryDword(L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", L"CDNServerType", &CDNServerType))
         {
             SL_LOG_INFO("Read CDNServerType: %d from registry", CDNServerType);
 
@@ -228,30 +213,12 @@ struct OTA : IOTA
 
     bool getDriverPath(std::wstring &driverPath) const
     {
-        auto getStringRegKey = [&](HKEY InKey, const WCHAR *InValueName, WCHAR *OutValue, DWORD dwBufferSize)->LONG
-        {
-            ULONG nError = RegGetValueW(InKey, NULL, InValueName, RRF_RT_REG_SZ, NULL, (LPBYTE)OutValue, &dwBufferSize);
-            return nError;
-        };
-
-        auto getPathFromRegistry = [&](const WCHAR *InRegKeyHive, const WCHAR *InRegKeyName, WCHAR *OutPath)->LONG
-        {
-            HKEY Key;
-            LONG Res = RegOpenKeyExW(HKEY_LOCAL_MACHINE, InRegKeyHive, 0, KEY_READ, &Key);
-            if (Res == ERROR_SUCCESS)
-            {
-                Res = getStringRegKey(Key, InRegKeyName, OutPath, sizeof(WCHAR) * MAX_PATH);
-                RegCloseKey(Key);
-            }
-            return Res;
-        };
-
         WCHAR pathAbsW[MAX_PATH] = {};
         // DCH driver
-        if(getPathFromRegistry(L"System\\CurrentControlSet\\Services\\nvlddmkm\\NGXCore", L"NGXPath", pathAbsW))    
+        if(!extra::getRegistryString(L"System\\CurrentControlSet\\Services\\nvlddmkm\\NGXCore", L"NGXPath", pathAbsW, MAX_PATH))
         {
             // Finally, fall back to legacy location (all nonDCH drivers should have this regkey present)
-            if (getPathFromRegistry(L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", L"FullPath", pathAbsW))
+            if (!extra::getRegistryString(L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", L"FullPath", pathAbsW, MAX_PATH))
             {
                 SL_LOG_ERROR("unable to find driver path");
             }

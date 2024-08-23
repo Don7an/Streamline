@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -25,6 +25,7 @@
 #include <dxgi1_5.h>
 #include <cinttypes>
 #include <atomic>
+#include <include/sl_version.h>
 
 struct ID3D11Device;
 struct ID3D12Device;
@@ -108,6 +109,7 @@ struct DECLSPEC_UUID("D3F0BBFF-3091-4074-9D9E-B99CE2E5CF9A") DXGISwapChain : IDX
     std::atomic<LONG> m_refCount = 1;
     uint32_t m_d3dVersion;
     uint32_t m_interfaceVersion;
+    sl::Version m_cachedHostSDKVersion;
 };
 }
 }

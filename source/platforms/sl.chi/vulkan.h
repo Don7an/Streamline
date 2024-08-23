@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -41,8 +41,12 @@ namespace sl
 namespace chi
 {
 
+class IReflexVk;
+
+constexpr uint64_t kMaxSemaphoreWaitUs = 500000000; // 500ms max wait on any semaphore;
 constexpr int kDescriptorCount = 32;
 constexpr int kDynamicOffsetCount = 32;
+constexpr int kDescriptorSetCount = 64;
 
 struct VulkanThreadContext : public CommonThreadContext
 {
@@ -59,28 +63,29 @@ struct VulkanThreadContext : public CommonThreadContext
 
 struct KernelDataVK : public KernelDataBase
 {
-    // VULKAN
     VkShaderModule shaderModule{};
     VkPipeline pipeline{};
     VkPipelineLayout pipelineLayout{};
     VkDescriptorSet descriptorSet{};
     VkDescriptorSetLayout descriptorSetLayout{};
     size_t descriptorIndex = 0;
-    size_t numDescriptors = 64;
+    size_t numDescriptorSets = kDescriptorSetCount;
+
+    void destroy(const VkLayerDispatchTable& ddt, VkDevice device);
 };
 
 struct PoolDescCombo
 {
     PoolDescCombo() {};
-    PoolDescCombo(const PoolDescCombo& rhs) { operator=(rhs); }
-    PoolDescCombo& operator=(const PoolDescCombo& rhs)
+    PoolDescCombo(const PoolDescCombo& rhs) = delete;
+    PoolDescCombo& operator=(const PoolDescCombo& rhs) = delete;
+
+    VkDescriptorPool pool{};
+    struct
     {
-        pool = rhs.pool;
-        desc = rhs.desc;
-        return *this;
-    }
-    VkDescriptorPool pool;
-    std::vector<VkDescriptorSet> desc{};
+        std::vector<VkDescriptorSet> descSet{};
+        size_t descSetIndex { kDescriptorSetCount - 1};
+    } descSetData{};
 };
 
 enum class DescriptorType
@@ -129,14 +134,8 @@ struct BindingSlot
 struct ResourceBindingDesc
 {
     ResourceBindingDesc() {};
-    ResourceBindingDesc(const ResourceBindingDesc& rhs) { operator=(rhs); }
-    inline ResourceBindingDesc& operator=(const ResourceBindingDesc& rhs)
-    {
-        maxDescSets = rhs.maxDescSets;
-        descriptors = rhs.descriptors;
-        offsets = rhs.offsets;
-        return *this;
-    }
+    ResourceBindingDesc(const ResourceBindingDesc& rhs) = delete;
+    ResourceBindingDesc& operator=(const ResourceBindingDesc& rhs) = delete;
 
     uint32_t maxDescSets = 1;
     std::map<uint32_t, BindingSlot> descriptors;
@@ -146,31 +145,19 @@ struct ResourceBindingDesc
 struct DispatchData
 {
     DispatchData() {};
-    DispatchData(const DispatchData& rhs) { operator=(rhs); }
-    inline DispatchData& operator=(const DispatchData& rhs)
-    {
-        kernel = rhs.kernel;
-        signature = rhs.signature;
-        signatureToDesc = rhs.signatureToDesc;
-        psoToSignature = rhs.psoToSignature;
-        return *this;
-    }
+    DispatchData(const DispatchData& rhs) = delete;
+    DispatchData& operator=(const DispatchData& rhs) = delete;
+
+    ~DispatchData();
 
     KernelDataVK *kernel;
     ResourceBindingDesc* signature = {};
     std::map<ResourceBindingDesc*, PoolDescCombo> signatureToDesc = {};
     std::map<size_t, ResourceBindingDesc*> psoToSignature = {};
-};
 
-struct SemaphoreVk : public sl::Resource
-{
-    SemaphoreVk(VkSemaphore s)
-    {
-        type = (sl::ResourceType)ResourceType::eFence;
-        native = s;
-        memory = {};
-        view = {};
-    };
+    VkLayerDispatchTable* pddt{};
+    VkDevice device{};
+    ICompute* compute{};
 };
 
 struct CommandQueueVk : public sl::Resource
@@ -211,9 +198,9 @@ class Vulkan : public Generic
     VkLayerInstanceDispatchTable m_idt;
     VkLayerDispatchTable m_ddt;
 
-    VkDevice m_device = VK_NULL_HANDLE;
-    VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
-    VkInstance m_instance = VK_NULL_HANDLE;
+    VkDevice m_device{};
+    VkPhysicalDevice m_physicalDevice{};
+    VkInstance m_instance{};
 
     VkSampler m_sampler[eSamplerCount] = {};
 
@@ -223,11 +210,8 @@ class Vulkan : public Generic
 
     VkCommandBuffer m_cmdBuffer;
 
-    VkSemaphore m_lowLatencySemaphore{};
-    uint64_t reflexSemaphoreValue = 0;
-
-    HMODULE m_hmodReflex{};
-
+    IReflexVk* m_reflex;
+    
     thread::ThreadContext<DispatchData> m_dispatchContext;
 
     struct PerfData
@@ -266,12 +250,23 @@ class Vulkan : public Generic
 
     // Some API Specific implementation that can be called only from the Generic API shim
     ComputeStatus transitionResourceImpl(CommandList InCmdList, const ResourceTransition* transisitions, uint32_t count) override final;
-    ComputeStatus createTexture2DResourceSharedImpl(ResourceDescription& InOutResourceDesc, Resource& OutResource, bool UseNativeFormat, ResourceState InitialState) override final;
-    ComputeStatus createBufferResourceImpl(ResourceDescription& InOutResourceDesc, Resource& OutResource, ResourceState InitialState) override final;
+    ComputeStatus createTexture2DResourceSharedImpl(ResourceDescription& InOutResourceDesc, Resource& OutResource, bool UseNativeFormat, ResourceState InitialState, const char InFriendlyName[]) override final;
+    ComputeStatus createBufferResourceImpl(ResourceDescription& InOutResourceDesc, Resource& OutResource, ResourceState InitialState, const char InFriendlyName[]) override final;
 
 
     virtual int destroyResourceDeferredImpl(const Resource InResource) override final;
     virtual std::wstring getDebugName(Resource res) override final;
+
+    ComputeStatus setDebugNameVk(VkDescriptorSet vkStruct, const char* name);
+    ComputeStatus setDebugNameVk(VkDescriptorSetLayout vkStruct, const char* name);
+    ComputeStatus setDebugNameVk(VkDeviceMemory vkStruct, const char* name);
+    ComputeStatus setDebugNameVk(VkPipeline vkStruct, const char* name);
+    ComputeStatus setDebugNameVk(VkPipelineLayout vkStruct, const char* name);
+    ComputeStatus setDebugNameVk(VkQueryPool vkStruct, const char* name);
+    ComputeStatus setDebugNameVk(VkSampler vkStruct, const char* name);
+    ComputeStatus setDebugNameVk(VkSemaphore vkStruct, const char* name);
+    ComputeStatus setDebugNameVk(VkDescriptorPool vkStruct, const char* name);
+    ComputeStatus setDebugNameVk(VkImageView vkStruct, const char* name);
 
 public:
 
@@ -280,6 +275,9 @@ public:
 
     virtual ComputeStatus getInstance(Instance& instance)  override { instance = m_instance;  return ComputeStatus::eOk; };
     virtual ComputeStatus getPhysicalDevice(PhysicalDevice& device)  override { device = m_physicalDevice;  return ComputeStatus::eOk; };
+    ComputeStatus getHostQueueInfo(chi::CommandQueue queue, void* pQueueInfo);
+    ComputeStatus getDeviceQueue(uint32_t queueFamily, uint32_t queueIndex, uint32_t queueFlags, VkQueue& queue);
+
     virtual ComputeStatus waitForIdle(Device device) override;
 
     virtual ComputeStatus getVendorId(VendorId& id) override final;
@@ -297,7 +295,7 @@ public:
     virtual ComputeStatus destroyCommandListContext(ICommandListContext* ctx) override final;
 
     virtual ComputeStatus createFence(FenceFlags flags, uint64_t initialValue, Fence& outFence, const char friendlyName[])  override final;
-    virtual ComputeStatus destroyFence(Fence fence) override final;
+    virtual ComputeStatus destroyFence(Fence& fence) override final;
 
     virtual ComputeStatus createCommandQueue(CommandQueueType type, CommandQueue& queue, const char friendlyName[], uint32_t index) override final;
     virtual ComputeStatus destroyCommandQueue(CommandQueue& queue) override final;
@@ -321,8 +319,8 @@ public:
     virtual ComputeStatus getResourceState(Resource resource, ResourceState& state) override final;
     virtual ComputeStatus getResourceDescription(Resource InResource, ResourceDescription &OutDesc) override final;
 
-    virtual ComputeStatus startTrackingResource(uint32_t id, Resource resource) override final { return ComputeStatus::eOk; }
-    virtual ComputeStatus stopTrackingResource(uint32_t id) override final { return ComputeStatus::eOk; }
+    virtual ComputeStatus startTrackingResource(uint64_t uid, Resource resource) override final { return ComputeStatus::eOk; }
+    virtual ComputeStatus stopTrackingResource(uint64_t uid, Resource dbgResource) override final { return ComputeStatus::eOk; }
 
     virtual ComputeStatus mapResource(CommandList cmdList, Resource resource, void*& data, uint32_t subResource = 0, uint64_t offset = 0, uint64_t totalBytes = UINT64_MAX) override final;
     virtual ComputeStatus unmapResource(CommandList cmdList, Resource resource, uint32_t subResource) override final;
@@ -343,9 +341,9 @@ public:
     virtual ComputeStatus getSleepStatus(ReflexState& settings) override final;
     virtual ComputeStatus getLatencyReport(ReflexState& settings) override final;
     virtual ComputeStatus sleep() override final;
-    virtual ComputeStatus setReflexMarker(ReflexMarker marker, uint64_t frameId) override final;
+    virtual ComputeStatus setReflexMarker(PCLMarker marker, uint64_t frameId) override final;
     virtual ComputeStatus notifyOutOfBandCommandQueue(CommandQueue queue, OutOfBandCommandQueueType type) override final;
-    virtual ComputeStatus setAsyncFrameMarker(CommandQueue queue, ReflexMarker marker, uint64_t frameId) override final;
+    virtual ComputeStatus setAsyncFrameMarker(CommandQueue queue, PCLMarker marker, uint64_t frameId) override final;
 
     // Helper methods for NGX feature requirements and slIsFeatureSupported
     static ComputeStatus createInstanceAndFindPhysicalDevice(uint32_t id, chi::Instance& instance, chi::PhysicalDevice& device);

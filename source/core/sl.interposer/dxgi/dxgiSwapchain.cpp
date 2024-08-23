@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -22,6 +22,7 @@
 
 #include <wrl/client.h>
 #include <d3d11.h>
+#include <mutex>
 
 #include "include/sl_hooks.h"
 #include "source/core/sl.interposer/dxgi/dxgiSwapchain.h"
@@ -48,7 +49,8 @@ DXGISwapChain::DXGISwapChain(ID3D11Device* device, IDXGISwapChain* original) :
 {
     assert(m_base != nullptr && m_d3dDevice != nullptr);
     m_d3dDevice->AddRef();
-    m_base->AddRef();    
+    m_base->AddRef();
+    m_cachedHostSDKVersion = sl::plugin_manager::getInterface()->getHostSDKVersion();
 }
 
 DXGISwapChain::DXGISwapChain(ID3D12Device* device, IDXGISwapChain* original) :
@@ -59,7 +61,8 @@ DXGISwapChain::DXGISwapChain(ID3D12Device* device, IDXGISwapChain* original) :
 {
     assert(m_base != nullptr && m_d3dDevice != nullptr);
     m_d3dDevice->AddRef();
-    m_base->AddRef();    
+    m_base->AddRef();
+    m_cachedHostSDKVersion = sl::plugin_manager::getInterface()->getHostSDKVersion();
 }
 
 bool DXGISwapChain::checkAndUpgradeInterface(REFIID riid)
@@ -125,9 +128,49 @@ HRESULT STDMETHODCALLTYPE DXGISwapChain::QueryInterface(REFIID riid, void** ppvO
 
 ULONG   STDMETHODCALLTYPE DXGISwapChain::AddRef()
 {
-    m_base->AddRef();
     return ++m_refCount;
 }
+
+// if several swap chains are presenting simultaneously - our tag tracking breaks down.
+// this class is to find 'unimportant' swap chains - so we could partially ignore them
+struct SwapChainTracker
+{
+    bool notifyAfterPresent(DXGISwapChain* p, bool isImportant)
+    {
+        DXGISwapChain *pCurrent = nullptr;
+        {
+            std::lock_guard lock(m_mutex);
+            if (m_pCurrentSwapChain == nullptr || isImportant)
+            {
+                m_pCurrentSwapChain = p;
+                m_isImportant = isImportant;
+            }
+            pCurrent = m_pCurrentSwapChain;
+        }
+        if (p != pCurrent)
+        {
+            SL_LOG_WARN("Streamline supports only one DXGISwapChain (currently it is 0x%p). Skipping some Present() hooks for DXGISwapChain 0x%p", pCurrent, p);
+            return false;
+        }
+        return true;
+    }
+    void notifySwapChainReleased(DXGISwapChain* p)
+    {
+        std::lock_guard lock(m_mutex);
+        if (m_pCurrentSwapChain == p)
+        {
+            m_pCurrentSwapChain = nullptr;
+            m_isImportant = false;
+        }
+    }
+
+private:
+    std::mutex m_mutex;
+    // the swap chain for which we're executing all the hooks
+    DXGISwapChain* m_pCurrentSwapChain = nullptr;
+    bool m_isImportant = false;
+};
+static SwapChainTracker g_swapChainTracker;
 
 ULONG   STDMETHODCALLTYPE DXGISwapChain::Release()
 {
@@ -143,18 +186,27 @@ ULONG   STDMETHODCALLTYPE DXGISwapChain::Release()
         SL_EXCEPTION_HANDLE_END_RETURN(-1)
     }
 
-    auto refOrigSC = m_base->Release();
     auto ref = --m_refCount;
     if (ref > 0)
     {
         return ref;
     }
 
+    ULONG refOrigSC = 12345;
+    // legacy behaviour - streamline before that version used to NOT decrement refcount here
+    // for legacy apps we do AddRef() + Release() so we could print the refOrigSC value
+    if (m_cachedHostSDKVersion <= sl::Version(2, 1, 0))
+    {
+        SL_LOG_INFO("Legacy behaviour for apps using SL <= 2.1 - issuing an extra AddRef() for the native swap chain");
+        refOrigSC = m_base->AddRef();
+    }
+    refOrigSC = m_base->Release();
     // Release the explicit reference to device that was added in the DXGISwapChain constructor above
     auto refOrig = m_d3dDevice->Release();
 
     SL_LOG_INFO("Destroyed DXGISwapChain proxy 0x%llx - native swap-chain 0x%llx ref count %ld", this, m_base, refOrigSC);
 
+    g_swapChainTracker.notifySwapChainReleased(this);
     delete this;
 
     return 0;
@@ -186,7 +238,8 @@ HRESULT STDMETHODCALLTYPE DXGISwapChain::Present(UINT SyncInterval, UINT Flags)
 {
     auto present = [this](UINT SyncInterval, UINT Flags)->HRESULT
     {
-        const auto& hooks = sl::plugin_manager::getInterface()->getBeforeHooks(FunctionHookID::eIDXGISwapChain_Present);
+        auto hooksId = FunctionHookID::eIDXGISwapChain_Present;
+        const auto& hooks = sl::plugin_manager::getInterface()->getBeforeHooks(hooksId);
         bool skip = false;
         HRESULT hr = S_OK;
         for (auto [hook, feature] : hooks)
@@ -200,6 +253,21 @@ HRESULT STDMETHODCALLTYPE DXGISwapChain::Present(UINT SyncInterval, UINT Flags)
         }
 
         if (!skip) hr = m_base->Present(SyncInterval, Flags);
+
+        if (g_swapChainTracker.notifyAfterPresent(this, skip))
+        {
+            const auto& hooksAfter = sl::plugin_manager::getInterface()->getAfterHooks(hooksId);
+            for (auto [hook, feature] : hooksAfter)
+            {
+                hr = ((PFunPresentAfter*)hook)(Flags);
+                if (FAILED(hr))
+                {
+                    SL_LOG_WARN("PFunPresentAfter failed %s", std::system_category().message(hr).c_str());
+                    return hr;
+                }
+            }
+        }
+
         return hr;
     };
     SL_EXCEPTION_HANDLE_START
@@ -279,7 +347,32 @@ HRESULT STDMETHODCALLTYPE DXGISwapChain::GetFullscreenState(BOOL* pFullscreen, I
 }
 HRESULT STDMETHODCALLTYPE DXGISwapChain::GetDesc(DXGI_SWAP_CHAIN_DESC* pDesc)
 {
-    return m_base->GetDesc(pDesc);
+    auto getDesc = [this](DXGI_SWAP_CHAIN_DESC* pDesc)->HRESULT
+    {
+        HRESULT hr = m_base->GetDesc(pDesc);
+        if (FAILED(hr))
+        {
+            SL_LOG_WARN("IDXGISwapChain::GetDesc failed with error code %s", std::system_category().message(hr).c_str());
+            return hr;
+        }
+        // plugins may want to adjust pDesc - give them the chance
+        {
+            const auto& hooks = sl::plugin_manager::getInterface()->getAfterHooks(FunctionHookID::eIDXGISwapChain_GetDesc);
+            for (auto [hook, feature] : hooks)
+            {
+                hr = ((PFunGetDescAfter*)hook)(m_base, pDesc);
+                if (FAILED(hr))
+                {
+                    SL_LOG_WARN("PFunGetDesc failed %s", std::system_category().message(hr).c_str());
+                    return hr;
+                }
+            }
+        }
+        return hr;
+    };
+    SL_EXCEPTION_HANDLE_START
+    return getDesc(pDesc);
+    SL_EXCEPTION_HANDLE_END_RETURN(E_ABORT)
 }
 HRESULT STDMETHODCALLTYPE DXGISwapChain::ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
@@ -347,9 +440,24 @@ HRESULT STDMETHODCALLTYPE DXGISwapChain::GetLastPresentCount(UINT* pLastPresentC
     return m_base->GetLastPresentCount(pLastPresentCount);
 }
 
-HRESULT STDMETHODCALLTYPE DXGISwapChain::GetDesc1(DXGI_SWAP_CHAIN_DESC1* pDesc)
+HRESULT STDMETHODCALLTYPE DXGISwapChain::GetDesc1(DXGI_SWAP_CHAIN_DESC1* pDesc1)
 {
-    return static_cast<IDXGISwapChain1*>(m_base)->GetDesc1(pDesc);
+    HRESULT hr = static_cast<IDXGISwapChain1*>(m_base)->GetDesc1(pDesc1);
+    if (FAILED(hr))
+    {
+        SL_LOG_WARN("GetDesc1() has failed: [%s]", std::system_category().message(hr).c_str());
+        return hr;
+    } 
+    // GetDesc() returns the correct buffer count - so take it from there
+    DXGI_SWAP_CHAIN_DESC desc;
+    hr = this->GetDesc(&desc);
+    if (FAILED(hr))
+    {
+        // no need to print anything here because we already print in GetDesc()
+        return hr;
+    }
+    pDesc1->BufferCount = desc.BufferCount;
+    return hr;
 }
 HRESULT STDMETHODCALLTYPE DXGISwapChain::GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pDesc)
 {
@@ -367,7 +475,8 @@ HRESULT STDMETHODCALLTYPE DXGISwapChain::Present1(UINT SyncInterval, UINT Presen
 {
     auto present = [this](UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS* pPresentParameters)->HRESULT
     {
-        const auto& hooks = sl::plugin_manager::getInterface()->getBeforeHooks(FunctionHookID::eIDXGISwapChain_Present1);
+        auto hooksId = FunctionHookID::eIDXGISwapChain_Present1;
+        const auto& hooks = sl::plugin_manager::getInterface()->getBeforeHooks(hooksId);
         bool skip = false;
         HRESULT hr = S_OK;
         for (auto [hook, feature] : hooks)
@@ -384,6 +493,21 @@ HRESULT STDMETHODCALLTYPE DXGISwapChain::Present1(UINT SyncInterval, UINT Presen
         {
             hr = static_cast<IDXGISwapChain1*>(m_base)->Present1(SyncInterval, PresentFlags, pPresentParameters);
         }
+
+        if (g_swapChainTracker.notifyAfterPresent(this, skip))
+        {
+            const auto& hooksAfter = sl::plugin_manager::getInterface()->getAfterHooks(hooksId);
+            for (auto [hook, feature] : hooksAfter)
+            {
+                hr = ((PFunPresentAfter*)hook)(PresentFlags);
+                if (FAILED(hr))
+                {
+                    SL_LOG_WARN("PFunPresentAfter failed %s", std::system_category().message(hr).c_str());
+                    return hr;
+                }
+            }
+        }
+
         return hr;
     };
     SL_EXCEPTION_HANDLE_START

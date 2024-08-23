@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -77,17 +77,19 @@ struct D3D11CommandListContext : public ICommandListContext
 
     RenderAPI getType() { return RenderAPI::eD3D11; }
 
-    void signalGPUFenceAt(uint32_t index)
+    bool signalGPUFenceAt(uint32_t index) override
     {
-        signalGPUFence(m_fence, ++m_syncValue);
+        return signalGPUFence(m_fence, ++m_syncValue);
     }
 
-    void signalGPUFence(Fence fence, uint64_t syncValue)
+    bool signalGPUFence(Fence fence, uint64_t syncValue) override
     {
         if (FAILED(m_cmdCtxImmediate->Signal((ID3D11Fence*)fence, syncValue)))
         {
             SL_LOG_ERROR( "Failed to signal on the command queue");
+            return false;
         }
+        return true;
     }
 
     WaitStatus waitCPUFence(Fence fence, uint64_t syncValue)
@@ -97,7 +99,7 @@ struct D3D11CommandListContext : public ICommandListContext
         return WaitStatus::eError;
     }
 
-    void waitGPUFence(Fence fence, uint64_t syncValue)
+    void waitGPUFence(Fence fence, uint64_t syncValue, const DebugInfo &debugInfo) override
     {
         if (FAILED(m_cmdCtxImmediate->Wait((ID3D11Fence*)fence, syncValue)))
         {
@@ -161,10 +163,8 @@ struct D3D11CommandListContext : public ICommandListContext
         return WaitStatus::eNoTimeout;
     }
 
-    uint32_t getBufferCount()
+    uint32_t getPrevCommandListIndex() override
     {
-        assert(false);
-        SL_LOG_ERROR( "Not implemented");
         return 0;
     }
 
@@ -178,9 +178,16 @@ struct D3D11CommandListContext : public ICommandListContext
         return m_syncValue;
     }
     
-    SyncPoint getNextSyncPoint()
+    SyncPoint getSyncPointAtIndex(uint32_t idx) override
     {
-        return { m_fence, m_syncValue + 1 };
+        return { m_fence, m_syncValue };
+    }
+
+    Fence getNextVkAcquireFence() override final
+    {
+        assert(false);
+        SL_LOG_ERROR("Not implemented");
+        return nullptr;
     }
 
     int acquireNextBufferIndex(SwapChain chain, uint32_t& index, sl::chi::Fence* semaphore)
@@ -197,6 +204,13 @@ struct D3D11CommandListContext : public ICommandListContext
         return WaitStatus::eError;
     }
 
+    uint64_t getCompletedValue(Fence fence)
+    {
+        assert(false);
+        SL_LOG_ERROR( "Not implemented");
+        return false;
+    }
+
     bool didCommandListFinish(uint32_t index)
     {
         assert(false);
@@ -210,7 +224,8 @@ struct D3D11CommandListContext : public ICommandListContext
         SL_LOG_ERROR("Not implemented");
     }
 
-    void waitOnGPUForTheOtherQueue(const ICommandListContext* other, uint32_t clIndex, uint64_t syncValue)
+    void waitOnGPUForTheOtherQueue(const ICommandListContext* other, uint32_t clIndex,
+        uint64_t syncValue, const DebugInfo &debugInfo) override
     {
         assert(false);
         SL_LOG_ERROR( "Not implemented");
@@ -1049,7 +1064,7 @@ bool D3D11::isSupportedFormat(DXGI_FORMAT format, int flag1, int flag2)
     return false;
 }
 
-ComputeStatus D3D11::createTexture2DResourceSharedImpl(ResourceDescription &InOutResourceDesc, Resource &OutResource, bool UseNativeFormat, ResourceState InitialState)
+ComputeStatus D3D11::createTexture2DResourceSharedImpl(ResourceDescription &InOutResourceDesc, Resource &OutResource, bool UseNativeFormat, ResourceState InitialState, const char InFriendlyName[])
 {
     ID3D11Texture2D* pResource = nullptr;
 
@@ -1150,7 +1165,7 @@ ComputeStatus D3D11::createTexture2DResourceSharedImpl(ResourceDescription &InOu
     return ComputeStatus::eOk;
 }
 
-ComputeStatus D3D11::createBufferResourceImpl(ResourceDescription &InOutResourceDesc, Resource &OutResource, ResourceState InitialState)
+ComputeStatus D3D11::createBufferResourceImpl(ResourceDescription &InOutResourceDesc, Resource &OutResource, ResourceState InitialState, const char InFriendlyName[])
 {
     ID3D11Buffer* pResource = nullptr;
 
@@ -1213,7 +1228,7 @@ ComputeStatus D3D11::createBufferResourceImpl(ResourceDescription &InOutResource
 
 ComputeStatus D3D11::setDebugName(Resource res, const char name[])
 {
-#if !(defined SL_PRODUCTION || defined SL_REL_EXT_DEV)
+#ifdef SL_DEBUG
     auto unknown = (IUnknown*)(res->native);
     ID3D11DeviceChild* deviceChild{};
     unknown->QueryInterface(&deviceChild);
@@ -1529,7 +1544,6 @@ ComputeStatus D3D11::getLUIDFromDevice(NVSDK_NGX_LUID *OutId)
 
 ComputeStatus D3D11::beginPerfSection(CommandList cmdList, const char *key, unsigned int node, bool reset)
 {
-#if SL_ENABLE_TIMING
     PerfData* data = {};
     {
         std::scoped_lock lock(m_mutexProfiler);
@@ -1565,13 +1579,11 @@ ComputeStatus D3D11::beginPerfSection(CommandList cmdList, const char *key, unsi
     auto context = (ID3D11DeviceContext*)cmdList;
     context->Begin(data->queryDisjoint);
     context->End(data->queryBegin);
-#endif
     return ComputeStatus::eOk;
 }
 
 ComputeStatus D3D11::endPerfSection(CommandList cmdList, const char* key, float &avgTimeMS, unsigned int node)
 {
-#if SL_ENABLE_TIMING
     PerfData* data = {};
     {
         std::scoped_lock lock(m_mutexProfiler);
@@ -1631,9 +1643,6 @@ ComputeStatus D3D11::endPerfSection(CommandList cmdList, const char* key, float 
     {
         SL_LOG_WARN("D3D11 time-stamp timed out");
     }
-#else
-    avgTimeMS = 0;
-#endif
     return ComputeStatus::eOk;
 }
 
@@ -1704,7 +1713,7 @@ ComputeStatus D3D11::notifyOutOfBandCommandQueue(CommandQueue queue, OutOfBandCo
     return ComputeStatus::eOk;
 }
 
-ComputeStatus D3D11::setAsyncFrameMarker(CommandQueue queue, ReflexMarker marker, uint64_t frameId)
+ComputeStatus D3D11::setAsyncFrameMarker(CommandQueue queue, PCLMarker marker, uint64_t frameId)
 {
     return ComputeStatus::eOk;
 }

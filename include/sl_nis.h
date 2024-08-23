@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -24,9 +24,6 @@
 
 namespace sl
 {
-
-//! NVIDIA Image Scaling
-constexpr Feature kFeatureNIS = 2;
 
 enum class NISMode : uint32_t
 {

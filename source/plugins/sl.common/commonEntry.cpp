@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -36,24 +36,30 @@
 #include "source/core/sl.param/parameters.h"
 #include "source/core/sl.interposer/d3d12/d3d12.h"
 #include "source/core/sl.interposer/vulkan/layer.h"
+#include "source/core/sl.log/log.h"
 #include "source/plugins/sl.common/versions.h"
 #include "source/platforms/sl.chi/d3d12.h"
 #include "source/platforms/sl.chi/vulkan.h"
 #include "source/platforms/sl.chi/capture.h"
 #include "source/plugins/sl.common/commonInterface.h"
+#include "source/plugins/sl.common/commonDRSInterface.h"
+#include "source/plugins/sl.common/drs.h"
 #include "_artifacts/gitVersion.h"
+#include "_artifacts/json/common_json.h"
 
 #ifdef SL_WINDOWS
 #define NV_WINDOWS
+// NT_SUCCESS macro
+#include <winternl.h>
 // Needed for SHGetKnownFolderPath
 #include <ShlObj.h>
 #pragma comment(lib,"shlwapi.lib")
 #endif
 
-#include "external/ngx/Include/nvsdk_ngx.h"
-#include "external/ngx/Include/nvsdk_ngx_helpers.h"
-#include "external/ngx/Include/nvsdk_ngx_helpers_vk.h"
-#include "external/ngx/Include/nvsdk_ngx_defs.h"
+#include "external/ngx-sdk/include/nvsdk_ngx.h"
+#include "external/ngx-sdk/include/nvsdk_ngx_helpers.h"
+#include "external/ngx-sdk/include/nvsdk_ngx_helpers_vk.h"
+#include "external/ngx-sdk/include/nvsdk_ngx_defs.h"
 #include "external/json/include/nlohmann/json.hpp"
 using json = nlohmann::json;
 
@@ -65,11 +71,13 @@ extern HRESULT slHookCreateCommittedResource(const D3D12_HEAP_PROPERTIES* pHeapP
 extern HRESULT slHookCreatePlacedResource(ID3D12Heap* pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riid, void** ppvResource);
 extern HRESULT slHookCreateReservedResource(const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riid, void** ppvResource);
 extern HRESULT slHookPresent(IDXGISwapChain* swapChain, UINT SyncInterval, UINT Flags, bool& Skip);
+extern HRESULT slHookAfterPresent(UINT Flags);
 extern HRESULT slHookPresent1(IDXGISwapChain* swapChain, UINT SyncInterval, UINT Flags, DXGI_PRESENT_PARAMETERS* params, bool& Skip);
 extern HRESULT slHookResizeSwapChainPre(IDXGISwapChain* swapChain, UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags, bool& Skip);
 
 // VULKAN
 extern VkResult slHookVkPresent(VkQueue Queue, const VkPresentInfoKHR* PresentInfo, bool& Skip);
+extern VkResult slHookVkAfterPresent();
 extern void slHookVkCmdBindPipeline(VkCommandBuffer CommandBuffer, VkPipelineBindPoint PipelineBindPoint, VkPipeline Pipeline);
 extern void slHookVkCmdBindDescriptorSets(VkCommandBuffer CommandBuffer, VkPipelineBindPoint PipelineBindPoint, VkPipelineLayout Layout, uint32_t FirstSet, uint32_t DescriptorSetCount, const VkDescriptorSet* DescriptorSets, uint32_t DynamicOffsetCount, const uint32_t* DynamicOffsets);
 extern void slHookVkBeginCommandBuffer(VkCommandBuffer CommandBuffer, const VkCommandBufferBeginInfo* BeginInfo);
@@ -116,15 +124,19 @@ struct CommonEntryContext
 {
     SL_PLUGIN_CONTEXT_CREATE_DESTROY(CommonEntryContext);
 
+    void onCreateContext() {};
     void onDestroyContext() {};
 
     bool needNGX = false;
     bool needDX11On12 = false;
+    bool needDRS = false;
 
     std::unordered_set<BufferTagInfo, BufferTagInfoHash> requiredTags{};
     
     NGXContextStandard ngxContext{};    // Regular context based on requested API from the host
     NGXContextD3D12 ngxContextD3D12{};  // Special context for plugins which run d3d11 on d3d12
+
+    DRSContext drsContext{};            // DRS context for plugins which use d3dreg keys
 
     common::SystemCaps* caps{};
 
@@ -140,68 +152,15 @@ struct CommonEntryContext
 };
 }
 
-//! These are the hooks we need to track resources
-//! 
-static const char* JSON = R"json(
-{
-    "id" : -1,
-    "priority" : 0,
-    "name" : "sl.common",
-    "namespace" : "common",
-    "rhi" : ["d3d11", "d3d12", "vk"],
-    "hooks" :
-    [
-        {
-            "class": "Vulkan",
-            "target" : "Present",
-            "replacement" : "slHookVkPresent",
-            "base" : "before"
-        },
-        {
-            "class": "Vulkan",
-            "target" : "CmdBindPipeline",
-            "replacement" : "slHookVkCmdBindPipeline",
-            "base" : "after"
-        },
-        {
-            "class": "Vulkan",
-            "target" : "CmdBindDescriptorSets",
-            "replacement" : "slHookVkCmdBindDescriptorSets",
-            "base" : "after"
-        },
-        {
-            "class": "Vulkan",
-            "target" : "BeginCommandBuffer",
-            "replacement" : "slHookVkBeginCommandBuffer",
-            "base" : "after"
-        },
-
-        {
-            "class": "IDXGISwapChain",
-            "target" : "ResizeBuffers",
-            "replacement" : "slHookResizeSwapChainPre",
-            "base" : "before"
-        },
-        {
-            "class": "IDXGISwapChain",
-            "target" : "Present",
-            "replacement" : "slHookPresent",
-            "base" : "before"
-        },
-        {
-            "class": "IDXGISwapChain",
-            "target" : "Present1",
-            "replacement" : "slHookPresent1",
-            "base" : "before"
-        }
-    ]
-}
-)json";
+//! Embedded JSON, containing information about the plugin and the hooks it requires.
+static std::string JSON = std::string(common_json, &common_json[common_json_len]);
 
 void updateEmbeddedJSON(json& config);
 
 //! Define our plugin
-SL_PLUGIN_DEFINE("sl.common", Version(VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH), Version(0, 0, 1), JSON, updateEmbeddedJSON, common, CommonEntryContext)
+SL_PLUGIN_DEFINE("sl.common", Version(VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH), Version(0, 0, 1), JSON.c_str(), updateEmbeddedJSON, common, CommonEntryContext)
+
+extern uint64_t getCurrentFrame();
 
 //! Thread safe get/set resource tag
 //! 
@@ -222,6 +181,10 @@ void getCommonTag(BufferType tagType, uint32_t id, CommonResource& res, const sl
                     res.extent = tag->extent;
                     res.res = *tag->resource;
 
+                    // Optional extensions are chained after the tag they belong to
+                    PrecisionInfo* optPi = findStruct<PrecisionInfo>(tag->next);
+                    res.pi = optPi ? *optPi : PrecisionInfo{};
+
                     //! Keep track of what tags are requested for what viewport (unique insert)
                     //! 
                     //! Note that the presence of a valid pointer to 'inputs' 
@@ -238,7 +201,25 @@ void getCommonTag(BufferType tagType, uint32_t id, CommonResource& res, const sl
     //! Now let's check the global ones
     uint64_t uid = ((uint64_t)tagType << 32) | (uint64_t)id;
     std::lock_guard<std::mutex> lock(ctx.resourceTagMutex);
-    res = ctx.idToResourceMap[uid];
+    CommonResource& resTmp = ctx.idToResourceMap[uid];
+    uint64_t uCurFrame = getCurrentFrame();
+    if (resTmp.uFrameWhenTagged != ~0ull && uCurFrame > resTmp.uFrameWhenTagged + 1)
+    {
+        if (resTmp)
+        {
+            SL_LOG_WARN("Tags are valid only until Present(). Invalidating the hanging tag %d for viewport %d (created at frame: %d, current frame: %d)", tagType, id, resTmp.uFrameWhenTagged, uCurFrame);
+            if (resTmp.clone)
+            {
+                ctx.pool->recycle(resTmp.clone);
+            }
+            else
+            {
+                ctx.compute->stopTrackingResource(uid, &resTmp.res);
+            }
+        }
+        resTmp = CommonResource();
+    }
+    res = resTmp;
     //! Keep track of what tags are requested for what viewport (unique insert)
     //! 
     //! Note that the presence of a valid pointer to 'inputs' indicates that we are called
@@ -246,11 +227,12 @@ void getCommonTag(BufferType tagType, uint32_t id, CommonResource& res, const sl
     ctx.requiredTags.insert({ id, tagType, inputs ? ResourceLifecycle::eValidUntilEvaluate : ResourceLifecycle::eValidUntilPresent });
 }
 
-sl::Result slSetTagInternal(const sl::Resource* resource, BufferType tag, uint32_t id, const Extent* ext, ResourceLifecycle lifecycle, CommandBuffer* cmdBuffer, bool localTag)
+sl::Result slSetTagInternal(const sl::Resource* resource, BufferType tag, uint32_t id, const Extent* ext, ResourceLifecycle lifecycle, CommandBuffer* cmdBuffer, bool localTag, const PrecisionInfo* pi)
 {
     auto& ctx = (*common::getContext());
     uint64_t uid = ((uint64_t)tag << 32) | (uint64_t)id;
     CommonResource cr{};
+    cr.uFrameWhenTagged = getCurrentFrame();
     if (resource && resource->native)
     {
         cr.res = *(sl::Resource*)resource;
@@ -259,7 +241,7 @@ sl::Result slSetTagInternal(const sl::Resource* resource, BufferType tag, uint32
             // Force common state for d3d11 in case engine is providing something that won't work on compute queue
             cr.res.state = 0;
         }
-#if defined SL_PRODUCTION || defined SL_REL_EXT_DEV
+#if defined(SL_PRODUCTION) || defined(SL_DEVELOP)
         // Check if state is provided but only if not running on D3D11
         if (ctx.platform != RenderAPI::eD3D11 && resource->state == UINT_MAX)
         {
@@ -272,7 +254,8 @@ sl::Result slSetTagInternal(const sl::Resource* resource, BufferType tag, uint32
         //! Note that tagging outputs as volatile is ignored, we need to write output into the engine's resource
         //!
         bool writeTag = tag == kBufferTypeScalingOutputColor || tag == kBufferTypeAmbientOcclusionDenoised ||
-            tag == kBufferTypeShadowDenoised || tag == kBufferTypeSpecularHitDenoised || tag == kBufferTypeDiffuseHitDenoised;
+            tag == kBufferTypeShadowDenoised || tag == kBufferTypeSpecularHitDenoised || tag == kBufferTypeDiffuseHitDenoised ||
+            tag == kBufferTypeBackbuffer;
         if (!writeTag && lifecycle != ResourceLifecycle::eValidUntilPresent)
         {
             //! Only make a copy if this tag is required by at least one loaded and supported plugin on the same viewport and with immutable life-cycle.
@@ -306,6 +289,11 @@ sl::Result slSetTagInternal(const sl::Resource* resource, BufferType tag, uint32
                 {
                     ctx.pool->recycle(prevTag.clone);
                 }
+                else
+                {
+                    ctx.compute->stopTrackingResource(uid, &prevTag.res);
+                }
+
                 // Defaults to eCopyDestination state 
                 cr.clone = ctx.pool->allocate(actualResource, extra::format("sl.tag.{}.volatile.{}", sl::getBufferTypeAsStr(tag), id).c_str());
 
@@ -321,12 +309,22 @@ sl::Result slSetTagInternal(const sl::Resource* resource, BufferType tag, uint32
                 };
                 CHI_CHECK_RR(ctx.compute->transitionResources(cmdBuffer, transitions, (uint32_t)countof(transitions), &revTransitions));
                 CHI_CHECK_RR(ctx.compute->copyResource(cmdBuffer, cr.clone, actualResource));
+
+                // We've made a copy of the original resource and we're not doing AddRef() on the original. So set the
+                // original to nullptr - that way nobody can access it (it may become invalid at some point).
+                cr.res.native = nullptr;
             }
         }
     }
+
     if (ext)
     {
         cr.extent = *ext;
+    }
+
+    if (pi)
+    {
+        cr.pi = *pi;
     }
 
     // No need to track volatile resources since we keep a copy
@@ -337,11 +335,11 @@ sl::Result slSetTagInternal(const sl::Resource* resource, BufferType tag, uint32
 
         if (cr.res.native)
         {
-            ctx.compute->startTrackingResource((uint32_t)tag, &cr.res);
+            ctx.compute->startTrackingResource(uid, &cr.res);
         }
         else
         {
-            ctx.compute->stopTrackingResource((uint32_t)tag);
+            ctx.compute->stopTrackingResource(uid, &cr.res);
         }
     }
 
@@ -352,18 +350,29 @@ sl::Result slSetTagInternal(const sl::Resource* resource, BufferType tag, uint32
         // Host can set null as a tag or even change the life-cycle of a tag, in that case any previously allocated copies must be recycled
         ctx.pool->recycle(prevTag.clone);
     }
-    ctx.idToResourceMap[uid] = cr;
+    prevTag = cr;
     return Result::eOk;
 }
 
+
+// For future reference, this function supports setting tags in 3 ways:
+//  * An array of ResourceTags
+//  * A linked-list of ResourceTags, using the `next` ptr to navigate the linked-list
+//  * A hybrid approach
+// Extensions usage:
+//  Additionally, we support extensions to ResourceTags via the `next` ptr.
+//  The requirement is that when setting tags, the developer should chain the extensions right after the tag that they belong to.
 sl::Result slSetTag(const sl::ViewportHandle& viewport, const sl::ResourceTag* resources, uint32_t numResources, sl::CommandBuffer* cmdBuffer)
 {
     for (uint32_t i = 0; i < numResources; i++)
     {
         auto tag = &resources[i];
-        while (tag)
+        while (tag != nullptr)
         {
-            SL_CHECK(slSetTagInternal(tag->resource, tag->type, viewport, &tag->extent, tag->lifecycle, cmdBuffer, false));
+            // Find the optional extension PrecisionInfo, until we see a ResourceTag (or nullptr) in the linked list
+            PrecisionInfo* optPi = findStruct<PrecisionInfo, ResourceTag>(tag->next);
+            SL_CHECK(slSetTagInternal(tag->resource, tag->type, viewport, &tag->extent, tag->lifecycle, cmdBuffer, false, optPi));
+
             tag = findStruct<ResourceTag>(tag->next);
         }
     }
@@ -415,6 +424,8 @@ void validateCommonConstants(const Constants& consts)
     SL_VALIDATE_BOOL(consts.orthographicProjection);
     SL_VALIDATE_BOOL(consts.motionVectorsDilated);
     SL_VALIDATE_BOOL(consts.motionVectorsJittered);
+
+    // minRelativeLinearDepthObjectSeparation does not need to be validated. It's entirely optional.
 }
 
 //! Thread safe get/set common constants
@@ -458,8 +469,11 @@ sl::Result slEvaluateFeature(sl::Feature feature, const sl::FrameToken& frame, c
             {
                 if (tag->lifecycle != ResourceLifecycle::eValidUntilPresent)
                 {
+                    // Optional extensions are chained after the tag they belong to
+                    PrecisionInfo* optPi = findStruct<PrecisionInfo>(tag->next);
+
                     //! Temporary tag, hence passing true
-                    SL_CHECK(slSetTagInternal(tag->resource, tag->type, *viewport, &tag->extent, tag->lifecycle, cmdBuffer, true));
+                    SL_CHECK(slSetTagInternal(tag->resource, tag->type, *viewport, &tag->extent, tag->lifecycle, cmdBuffer, true, optPi));
                 }
             }
         }
@@ -841,6 +855,7 @@ void allocateNGXResourceCallback(D3D12_RESOURCE_DESC* desc, int state, CD3DX12_H
     resDesc.format = chi::eFormatINVALID;
     resDesc.heapType = (chi::HeapType)heap->Type;
 
+
     auto compute = ctx.computeD3D12 ? ctx.computeD3D12 : ctx.compute;
 
     //! Redirecting to host app if allocate callback is specified in sl::Preferences
@@ -1024,6 +1039,7 @@ void updateCommonEmbeddedJSONConfig(void* jsonConfig, const common::PluginInfo& 
     {
         ctx.needNGX |= info.needsNGX;
         ctx.needDX11On12 |= info.needsDX11On12;
+        ctx.needDRS |= info.needsDRS;
     }
 }
 
@@ -1302,6 +1318,31 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
             SL_LOG_WARN("Failed to initialize NGX, any SL feature requiring NGX will be unloaded and disabled");
         }
     }
+    if (ctx.needDRS)
+    {
+        // DRS initialization
+        SL_LOG_INFO("At least one plugin requires DRS, trying to initialize ...");
+
+        // Reset our flag until we see if DRS can be initialized correctly
+        ctx.needDRS = false;
+        bool drsStatus = drs::drsInit();
+        if (drsStatus)
+        {
+            ctx.needDRS = true;
+            SL_LOG_HINT("DRS loaded - app id %u", appId);
+
+            // Provide DRS context to other plugins
+            ctx.drsContext.drsReadKey = drs::drsReadKey;
+            ctx.drsContext.drsReadKeyFromProfile = drs::drsReadKeyFromProfile;
+            ctx.drsContext.drsReadKeyString = drs::drsReadKeyString;
+            ctx.drsContext.drsReadKeyStringFromProfile = drs::drsReadKeyStringFromProfile;
+            parameters->set(param::global::kDRSContext, &ctx.drsContext);
+        }
+        else
+        {
+            SL_LOG_WARN("Failed to initialize DRS");
+        }
+    }
 
     return true;
 }
@@ -1359,6 +1400,12 @@ void slOnPluginShutdown()
         ctx.needNGX = false;
     }
 
+    if (ctx.needDRS)
+    {
+        drs::drsShutdown();
+        ctx.needDRS = false;
+    }
+
     // Common shutdown
     plugin::onShutdown(api::getContext());
 
@@ -1367,6 +1414,7 @@ void slOnPluginShutdown()
 
 using PFunRtlGetVersion = NTSTATUS(WINAPI*)(PRTL_OSVERSIONINFOW);
 using PFunNtSetTimerResolution = NTSTATUS(NTAPI*)(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
+using PFunNtQueryTimerResolution = NTSTATUS(NTAPI*)(PULONG MinimumResolution, PULONG MaximumResolution, PULONG CurrentResolution);
 
 bool getOSVersionAndUpdateTimerResolution(common::SystemCaps* caps)
 {
@@ -1478,22 +1526,44 @@ bool getOSVersionAndUpdateTimerResolution(common::SystemCaps* caps)
         caps->osVersionBuild = vNT.build;
     }
 
+    auto NtQueryTimerResolution = reinterpret_cast<PFunNtQueryTimerResolution>(GetProcAddress(handle, "NtQueryTimerResolution"));
     auto NtSetTimerResolution = reinterpret_cast<PFunNtSetTimerResolution>(GetProcAddress(handle, "NtSetTimerResolution"));
-    if (NtSetTimerResolution)
+    if (NtSetTimerResolution && NtQueryTimerResolution)
     {
-        ULONG currentRes{};
-        if (!NtSetTimerResolution(5000, TRUE, &currentRes))
+        // SL wants a minimum timer resolution of 0.5ms. The application may have already set a finer-grained value, this is fine, and SL should not modify the timer resolution.
+        const ULONG slPreferredTimerRes = 5000UL;
+
+        ULONG minRes = ULONG_MAX;
+        ULONG maxRes = slPreferredTimerRes;
+        ULONG setRes = slPreferredTimerRes;
+        ULONG currentRes = ULONG_MAX;
+
+        if (!NT_SUCCESS(NtQueryTimerResolution(&minRes, &maxRes, &currentRes)))
         {
-            SL_LOG_INFO("Changed high resolution timer resolution to 5000 [100 ns units]");
+            SL_LOG_WARN("Failed to query high resolution timer capabilities, assuming it supports at least %u [100 ns units].", slPreferredTimerRes);
         }
-        else
+
+        if (currentRes > slPreferredTimerRes)
         {
-            SL_LOG_WARN("Failed to change high resolution timer resolution to 5000 [100 ns units]");
+            if (maxRes > slPreferredTimerRes)
+            {
+                SL_LOG_INFO("Preferred high resolution timer resolution (%u) is unsupported, trying %u [100 ns units] instead.", slPreferredTimerRes, maxRes);
+                setRes = maxRes;
+            }
+
+            if (NT_SUCCESS(NtSetTimerResolution(setRes, TRUE, &currentRes)))
+            {
+                SL_LOG_INFO("Changed high resolution timer resolution to %u [100 ns units].", currentRes);
+            }
+            else
+            {
+                SL_LOG_WARN("Failed to change high resolution timer resolution to %u [100 ns units].", setRes);
+            }
         }
     }
     else
     {
-        SL_LOG_WARN("Failed to retrieve the NtSetTimerResolution() function from ntdll.");
+        SL_LOG_WARN("Failed to retrieve the NtQueryTimerResolution() and NtSetTimerResolution() functions from ntdll.");
     }
     return res;
 }
@@ -1584,10 +1654,12 @@ SL_EXPORT void* slGetPluginFunction(const char* functionName)
     //! D3D12
     SL_EXPORT_FUNCTION(slHookPresent);
     SL_EXPORT_FUNCTION(slHookPresent1);
+    SL_EXPORT_FUNCTION(slHookAfterPresent);
     SL_EXPORT_FUNCTION(slHookResizeSwapChainPre);
     
     //! Vulkan
     SL_EXPORT_FUNCTION(slHookVkPresent);
+    SL_EXPORT_FUNCTION(slHookVkAfterPresent);
     SL_EXPORT_FUNCTION(slHookVkCmdBindPipeline);
     SL_EXPORT_FUNCTION(slHookVkCmdBindDescriptorSets);
     SL_EXPORT_FUNCTION(slHookVkBeginCommandBuffer);

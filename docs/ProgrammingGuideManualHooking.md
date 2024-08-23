@@ -2,7 +2,7 @@
 Streamline - Manual Hooking
 =======================
 
-Version 2.1.0
+Version 2.4.11
 =======
 
 The automated global hooking is a great way to quickly enable SL features in any application. However, this can lead to unnecessary overhead caused by the entire API redirection through SL proxies and problems with tools and 3rd party libraries which do not expect to receive SL proxies as inputs.
@@ -10,7 +10,7 @@ The automated global hooking is a great way to quickly enable SL features in any
 To address this SL provides "manual" hooking which is slightly more involved style of integration leveraging `slGetNativeInterface` and `slUpgradeInterface` APIs.
 
 > **IMPORTANT:**
-> Please read the general [ProgrammingGuide.md](docs/ProgrammingGuide.md) before proceeding with this advanced method of integration.
+> Please read the general [ProgrammingGuide.md](ProgrammingGuide.md) before proceeding with this advanced method of integration.
 
 ### 1.0 LINKING
 
@@ -67,6 +67,9 @@ enum class FunctionHookID : uint32_t
     eVulkan_DestroySwapchainKHR,
     eVulkan_GetSwapchainImagesKHR,
     eVulkan_AcquireNextImageKHR,
+    eVulkan_DeviceWaitIdle,
+    eVulkan_CreateWin32SurfaceKHR,
+    eVulkan_DestroySurfaceKHR,
 
     eMaxNum
 };
@@ -318,15 +321,15 @@ else
     auto vkGetInstanceProcAddrProxy = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(mod, "vkGetInstanceProcAddr"));
 
     // Get SL proxies for ALL mandatory APIs listed in the sl_hooks.h
-    PFN_vkCreateSwapchainKHR  vkCreateSwapchainKHRProxy = reinterpret_cast<PFN_vkCreateSwapchainKHR>vkGetDeviceProcAddrProxy(mod,"vkCreateSwapchainKHR");
-    PFN_vkDestroySwapchainKHR  vkDestroySwapchainKHRProxy = reinterpret_cast<PFN_vkDestroySwapchainKHR>vkGetDeviceProcAddrProxy(mod,"vkDestroySwapchainKHR");
-    PFN_vkGetSwapchainImagesKHR  vkGetSwapchainImagesKHRProxy = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>vkGetDeviceProcAddrProxy(mod,"vkGetSwapchainImagesKHR");
-    PFN_vkAcquireNextImageKHR  vkAcquireNextImageKHRProxy = reinterpret_cast<PFN_vkAcquireNextImageKHR>vkGetDeviceProcAddrProxy(mod,"vkAcquireNextImageKHR");
-    PFN_vkQueuePresentKHR vkQueuePresentKHRProxy = reinterpret_cast<PFN_vkQueuePresentKHR>vkGetDeviceProcAddrProxy(mod,"vkQueuePresentKHR");
+    PFN_vkCreateSwapchainKHR  vkCreateSwapchainKHRProxy = reinterpret_cast<PFN_vkCreateSwapchainKHR>(vkGetDeviceProcAddrProxy(device,"vkCreateSwapchainKHR"));
+    PFN_vkDestroySwapchainKHR  vkDestroySwapchainKHRProxy = reinterpret_cast<PFN_vkDestroySwapchainKHR>(vkGetDeviceProcAddrProxy(device,"vkDestroySwapchainKHR"));
+    PFN_vkGetSwapchainImagesKHR  vkGetSwapchainImagesKHRProxy = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(vkGetDeviceProcAddrProxy(device,"vkGetSwapchainImagesKHR"));
+    PFN_vkAcquireNextImageKHR  vkAcquireNextImageKHRProxy = reinterpret_cast<PFN_vkAcquireNextImageKHR>(vkGetDeviceProcAddrProxy(device,"vkAcquireNextImageKHR"));
+    PFN_vkQueuePresentKHR vkQueuePresentKHRProxy = reinterpret_cast<PFN_vkQueuePresentKHR>(vkGetDeviceProcAddrProxy(device,"vkQueuePresentKHR"));
     
     // Optional but it makes integrations much easier since SL will take care of adding requires extensions, enabling features and any extra command queues
-    PFN_vkCreateDevice vkCreateDeviceProxy = reinterpret_cast<PFN_vkCreateDevice>vkGetDeviceProcAddrProxy(mod,"vkCreateDevice");
-    PFN_vkCreateInstance vkCreateInstanceProxy = reinterpret_cast<PFN_vkCreateInstance>vkGetDeviceProcAddrProxy(mod,"vkCreateInstance");
+    PFN_vkCreateDevice vkCreateDeviceProxy = reinterpret_cast<PFN_vkCreateDevice>(vkGetInstanceProcAddrProxy(instance,"vkCreateDevice"));
+    PFN_vkCreateInstance vkCreateInstanceProxy = reinterpret_cast<PFN_vkCreateInstance>(vkGetInstanceProcAddrProxy(instance,"vkCreateInstance"));
 }
 ```
 
@@ -590,3 +593,4 @@ void restorePipeline(VkCommandBuffer cmdBuffer)
 
 > **IMPORTANT:**
 > Failure to restore command list(buffer) state correctly will cause your application to crash or misbehave in some other form.
+
